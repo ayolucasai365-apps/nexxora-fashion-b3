@@ -323,7 +323,7 @@ def login():
                     st.session_state["sb"] = cl
                     st.rerun()
                 except Exception as e:
-                    st.error("Sign-in failed: {e}")
+                    st.error(f"Sign-in failed: {e}")
 
 
 def main():
