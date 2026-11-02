@@ -322,8 +322,8 @@ def login():
                     cl.auth.sign_in_with_password({"email": email, "password": pw})
                     st.session_state["sb"] = cl
                     st.rerun()
-                except Exception:
-                    st.error("Sign-in failed. Check your email and password.")
+                except Exception as e:
+                    st.error("Sign-in failed: {e}")
 
 
 def main():
