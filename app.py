@@ -313,17 +313,22 @@ def login():
     _, mid, _ = st.columns([1, 2, 1])
     with mid:
         st.title(f"{BIZ} 🧵")
+        if not URL.startswith("https://") or "YOUR-" in URL or "YOUR-" in KEY:
+            st.error("The app's Secrets are not set correctly. Open Manage app > Settings > Secrets "
+                     "and paste the real SUPABASE_URL (starts with https://) and SUPABASE_ANON_KEY.")
         with st.form("login"):
             email = st.text_input("Email")
             pw = st.text_input("Password", type="password")
-            if st.form_submit_button("Sign in", type="primary"):
-                try:
-                    cl = create_client(URL, KEY)
-                    cl.auth.sign_in_with_password({"email": email, "password": pw})
-                    st.session_state["sb"] = cl
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Sign-in failed: {e}")
+            go = st.form_submit_button("Sign in", type="primary")
+        if go:
+            try:
+                cl = create_client(URL.strip(), KEY.strip())
+                cl.auth.sign_in_with_password({"email": email.strip(), "password": pw})
+                st.session_state["sb"] = cl
+                st.rerun()
+            except Exception as e:
+                st.error("Sign-in failed. The details are below.")
+                st.exception(e)
 
 
 def main():
