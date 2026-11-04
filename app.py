@@ -50,23 +50,51 @@ def look(table, val, label):
     return {r[val]: r[label] for r in q.execute().data}
 
 
+LAB = {"reorder_level": "Low-stock alert at", "on_hand": "On hand",
+       "delivery_impact_days": "Delivery impact (days)", "design_window": "Design window"}
+
+
 def lab(c):
-    return c.replace("_", " ").capitalize()
+    return LAB.get(c, c.replace("_", " ").capitalize())
 
 
 def F(col, label=None, kind="t", extra=None, default=None):
     return (col, label or lab(col), kind, extra, default)
 
 
+def err(e):
+    st.error(getattr(e, "message", None) or str(e))
+
+
+def done(msg):
+    st.session_state["flash"] = msg
+    st.rerun()
+
+
+def stage_info():
+    """{stage_key: (position, label)}"""
+    return {s["key"]: (s["position"], s["label"]) for s in rows("stages", order="position", desc=False)}
+
+
+def window_of(stage, stored, info):
+    """The design lock follows the order's stage: from Cutting onward it is LOCKED."""
+    if stage in info and info[stage][0] >= info["cutting"][0]:
+        return "locked"
+    return "limited" if stored == "limited" else "open"
+
+
 # kinds: t text, n number, d date, x long text, j key=value pairs, s select
 CFG = {
     "orders": dict(title="Orders", order="created_at",
-        cols=["order_no", "customer_id", "due_date", "stage", "total_amount"],
+        sel="*, fashion_order_details(garment_type,fabric,style)",
+        cols=["order_no", "customer_id", "garment_type", "fabric", "style", "due_date", "stage", "total_amount"],
         f=[F("customer_id", "Customer", "s", "customers:id:full_name"),
            F("offering_id", "Offering", "s", "offerings:id:name"),
            F("due_date", "Due date", "d"), F("total_amount", "Total price", "n"),
            F("stage", "Stage", "s", "stages:key:label", "order_received"),
-           F("original_instructions", "Original instructions (paste WhatsApp text)", "x")]),
+           F("original_instructions", "Original instructions (paste WhatsApp text)", "x")],
+        d=[F("garment_type", "Garment type"), F("fabric", "Fabric (text description)"), F("style"),
+           F("modifications", kind="x"), F("special_requirements", kind="x")]),
     "offerings": dict(title="Offerings", order="created_at", cols=["name", "base_price", "description"],
         f=[F("name"), F("base_price", "Base price", "n"), F("description", kind="x")]),
     "customers": dict(title="Customers", order="created_at", cols=["full_name", "phone", "whatsapp", "email"],
@@ -78,16 +106,14 @@ CFG = {
            F("unit", kind="s", extra=["inches", "cm"], default="inches"),
            F("measurement_values", "Measurements (e.g. bust=36, waist=28, hip=40)", "j"),
            F("note")]),
-    "fashion_order_details": dict(title="Design details", order=None, up=True,
-        cols=["order_id", "garment_type", "fabric", "style", "change_window"],
+    "fashion_order_details": dict(title="Design details", order=None, up=True, sel="*, orders(stage)",
+        cols=["order_id", "garment_type", "fabric", "style", "modifications", "design_window"],
         f=[F("order_id", "Order", "s", "orders:id:order_no"), F("garment_type"),
            F("fabric", "Fabric (text description)"), F("style"),
            F("modifications", kind="x"), F("special_requirements", kind="x"),
-           F("change_window", "Change window", "s", ["open", "limited", "locked"])]),
+           F("change_window", "Change window (it locks by itself at Cutting)", "s", ["open", "limited"])]),
     "fashion_design_changes": dict(title="Design changes", order="created_at",
-        cols=["order_id", "request", "extra_cost", "delivery_impact_days"],
-        f=[F("order_id", "Order", "s", "orders:id:order_no"), F("request", kind="x"),
-           F("extra_cost", "Extra cost", "n"), F("delivery_impact_days", "Delivery impact (days)", "n")]),
+        cols=["order_id", "request", "extra_cost", "delivery_impact_days", "created_at"], f=[]),
     "fashion_qc": dict(title="Quality control", order="checked_at",
         cols=["order_id", "result", "notes", "checked_at"],
         f=[F("order_id", "Order", "s", "orders:id:order_no"),
@@ -104,21 +130,11 @@ CFG = {
         cols=["order_no", "total_amount", "paid", "outstanding", "payment_status"]),
     "expenses": dict(title="Expenses", order="spent_on", cols=["category", "description", "amount", "spent_on"],
         f=[F("category"), F("description"), F("amount", kind="n"), F("spent_on", "Date", "d")]),
-    "stock_items": dict(title="Stock items", order="created_at",
-        cols=["name", "kind", "ownership", "customer_id", "colour", "unit", "reorder_level"],
-        f=[F("name"), F("kind", kind="s", extra=["fabric", "material"], default="fabric"),
-           F("ownership", kind="s", extra=["shop", "client"], default="shop"),
-           F("customer_id", "Client (only if client-owned)", "s", "customers:id:full_name"),
-           F("colour"), F("unit", "Unit (fabric must be yards)", default="yards"),
-           F("reorder_level", "Low-stock level", "n")]),
-    "stock_movements": dict(title="Stock in / out", order="created_at",
-        cols=["item_id", "movement_type", "qty", "order_id", "note", "created_at"],
-        f=[F("item_id", "Item", "s", "stock_items:id:name"),
-           F("movement_type", "Type", "s", ["opening", "in", "out", "adjust_up", "adjust_down"]),
-           F("qty", "Quantity (yards)", "n"), F("order_id", "For order", "s", "orders:id:order_no"),
-           F("note")]),
     "stock_levels": dict(title="Stock levels", ro=True, order=None,
-        cols=["name", "kind", "ownership", "colour", "on_hand", "unit", "reorder_level"]),
+        cols=["name", "kind", "ownership", "customer_id", "colour", "on_hand", "unit", "reorder_level", "status"],
+        f=[F("customer_id", "Client", "s", "customers:id:full_name")]),
+    "stock_in": dict(title="Stock in"),
+    "stock_out": dict(title="Stock out"),
     "rtw_products": dict(title="RTW products", order="created_at", cols=["style_code", "name", "price"],
         f=[F("style_code", "Style code"), F("name"), F("price", kind="n"), F("description", kind="x")]),
     "rtw_variants": dict(title="SKUs / variants", order=None,
@@ -163,13 +179,14 @@ NAV = {
     "Production board": None,
     "Customers": ["customers", "fashion_measurements"],
     "Fashion": ["fashion_order_details", "fashion_design_changes", "fashion_qc", "fashion_fittings"],
-    "Stock": ["stock_levels", "stock_items", "stock_movements"],
+    "Stock": ["stock_levels", "stock_in", "stock_out"],
     "Ready-to-wear": ["rtw_levels", "rtw_products", "rtw_variants", "rtw_movements", "quick_sales", "quick_sale_items"],
     "Money": ["payments", "order_balances", "expenses"],
     "Team": ["work_updates", "attendance", "communications", "message_templates"],
 }
 
 
+# ---------------------------------------------------------------- generic add + list
 def widget(name, f, maps):
     col, label, kind, extra, default = f
     key = f"{name}_{col}"
@@ -207,31 +224,53 @@ def clean(f, v):
     return v
 
 
-def table_view(name):
+def add_form(name):
+    c = CFG[name]
+    fields = c["f"] + c.get("d", [])
+    maps = {f[0]: look(*f[3].split(":")) for f in fields if f[2] == "s" and isinstance(f[3], str)}
+    with st.expander(f"➕ Add — {c['title']}"):
+        with st.form(f"add_{name}", clear_on_submit=True):
+            grid = st.columns(2)
+            vals = {}
+            for i, f in enumerate(fields):
+                with grid[i % 2]:
+                    vals[f[0]] = widget(name, f, maps)
+            if st.form_submit_button("Save", type="primary"):
+                rec = {f[0]: clean(f, vals[f[0]]) for f in c["f"]}
+                rec = {k: v for k, v in rec.items() if v is not None}
+                det = {f[0]: clean(f, vals[f[0]]) for f in c.get("d", [])}
+                det = {k: v for k, v in det.items() if v is not None}
+                try:
+                    t = db().table(name)
+                    res = (t.upsert(rec) if c.get("up") else t.insert(rec)).execute()
+                    if det:  # order details (garment, fabric, style...) go to the design details record
+                        db().table("fashion_order_details").upsert({"order_id": res.data[0]["id"], **det}).execute()
+                    done("Saved")
+                except Exception as e:  # database rules show here, e.g. a refused change
+                    err(e)
+
+
+def list_view(name):
     c = CFG[name]
     maps = {f[0]: look(*f[3].split(":")) for f in c.get("f", []) if f[2] == "s" and isinstance(f[3], str)}
-    if not c.get("ro"):
-        with st.expander(f"➕ Add — {c['title']}"):
-            with st.form(f"add_{name}", clear_on_submit=True):
-                grid = st.columns(2)
-                vals = {}
-                for i, f in enumerate(c["f"]):
-                    with grid[i % 2]:
-                        vals[f[0]] = widget(name, f, maps)
-                if st.form_submit_button("Save", type="primary"):
-                    rec = {f[0]: clean(f, vals[f[0]]) for f in c["f"]}
-                    rec = {k: v for k, v in rec.items() if v is not None}
-                    try:
-                        t = db().table(name)
-                        (t.upsert(rec) if c.get("up") else t.insert(rec)).execute()
-                        st.success("Saved")
-                        st.rerun()
-                    except Exception as e:  # shows database rules too, e.g. "Design is LOCKED"
-                        st.error(str(e))
-    data = rows(name, order=c.get("order"))
+    data = rows(name, select=c.get("sel", "*"), order=c.get("order"))
     if not data:
         st.info("Nothing here yet.")
         return
+    if name == "orders":
+        for r in data:
+            det = r.pop("fashion_order_details", None)
+            det = det[0] if isinstance(det, list) and det else det
+            r.update(det or {})
+    if name == "fashion_order_details":
+        info = stage_info()
+        for r in data:
+            stg = (r.pop("orders", None) or {}).get("stage")
+            w = window_of(stg, r.get("change_window"), info)
+            r["design_window"] = f"LOCKED (at {info[stg][1]})" if w == "locked" else w
+    if name == "stock_levels":
+        for r in data:
+            r["status"] = "LOW" if float(r["on_hand"]) <= float(r["reorder_level"]) else "OK"
     df = pd.DataFrame(data)
     for col, m in maps.items():
         if col in df:
@@ -241,6 +280,171 @@ def table_view(name):
             df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d %b %Y")
     show = [x for x in c["cols"] if x in df]
     st.dataframe(df[show].rename(columns=lab), use_container_width=True, hide_index=True)
+
+
+def table_view(name):
+    if not CFG[name].get("ro"):
+        add_form(name)
+    if name == "stock_levels":
+        st.caption("**Low-stock alert at** is the level that warns you: when the yards on hand fall to this "
+                   "number or below, the item shows LOW and appears on the dashboard. "
+                   "It is not an amount you take out; use the Stock out tab for that.")
+    list_view(name)
+
+
+# ---------------------------------------------------------------- design changes (locks at Cutting)
+def design_changes():
+    info = stage_info()
+    orders = rows("orders", "id,order_no,stage,customers(full_name)", order="created_at")
+    pick = st.selectbox("Choose the order", [None] + orders,
+                        format_func=lambda o: "—" if o is None else f"{o['order_no']} — {o['customers']['full_name']}")
+    if pick:
+        pos, label = info[pick["stage"]]
+        if pos >= info["cutting"][0]:
+            st.error(f"🔒 {pick['order_no']} is at the **{label}** stage. The design is LOCKED, "
+                     "so no design changes are accepted.")
+        else:
+            st.success(f"{pick['order_no']} is at **{label}**. Design changes are still allowed.")
+            with st.form("design_change", clear_on_submit=True):
+                req = st.text_area("What does the customer want changed?")
+                a, b = st.columns(2)
+                cost = a.number_input("Extra cost", value=None, min_value=0.0)
+                days = b.number_input("Delivery impact (days)", value=None, min_value=0.0)
+                if st.form_submit_button("Save change request", type="primary"):
+                    if not req.strip():
+                        st.error("Describe the change first.")
+                    else:
+                        rec = {"order_id": pick["id"], "request": req.strip()}
+                        if cost:
+                            rec["extra_cost"] = cost
+                        if days:
+                            rec["delivery_impact_days"] = int(days)
+                        try:
+                            db().table("fashion_design_changes").insert(rec).execute()
+                            done("Change request saved")
+                        except Exception as e:
+                            err(e)
+    st.markdown("**All design change requests**")
+    list_view("fashion_design_changes")
+
+
+# ---------------------------------------------------------------- stock in / out
+def movement_history(types):
+    items = look("stock_items", "id", "name")
+    orders = look("orders", "id", "order_no")
+    data = (db().table("stock_movements").select("*").in_("movement_type", types)
+            .order("created_at", desc=True).limit(200).execute().data)
+    if not data:
+        st.info("Nothing recorded yet.")
+        return
+    df = pd.DataFrame(data)
+    df["item"] = df["item_id"].map(items)
+    df["order"] = df["order_id"].map(orders)
+    df["date"] = pd.to_datetime(df["created_at"]).dt.strftime("%d %b %Y")
+    st.dataframe(df[["item", "movement_type", "qty", "order", "note", "date"]].rename(columns=lab),
+                 use_container_width=True, hide_index=True)
+
+
+def stock_in():
+    items = rows("stock_levels")
+    clients = look("customers", "id", "full_name")
+    orders = look("orders", "id", "order_no")
+    with st.expander("➕ Record stock in", expanded=True):
+        with st.form("stock_in", clear_on_submit=True):
+            item = st.selectbox("Existing item", [None] + items, format_func=lambda i: "— new item: fill the details below —"
+                                if i is None else f"{i['name']} ({i['ownership']}) · {i['on_hand']} {i['unit']} on hand")
+            st.caption("Adding to an item you already have? Choose it above and skip the new-item details.")
+            a, b = st.columns(2)
+            name = a.text_input("New item name")
+            kind = b.selectbox("Kind", ["fabric", "material"])
+            owner = a.selectbox("Ownership", ["shop", "client"])
+            client = b.selectbox("Client (only if client-owned)", [None] + list(clients),
+                                 format_func=lambda k: "—" if k is None else clients[k])
+            colour = a.text_input("Colour")
+            unit = b.text_input("Unit (materials only; fabric is always yards)", value="yards")
+            alert = a.number_input("Low-stock alert at (warn me when on hand is this or less)", value=None, min_value=0.0)
+            st.divider()
+            qty = a.number_input("Quantity (yards for fabric)", value=None, min_value=0.0)
+            mtype = b.selectbox("Type", ["Opening stock", "Received / purchased", "Adjustment (add)"])
+            order = a.selectbox("For order (optional)", [None] + list(orders),
+                                format_func=lambda k: "—" if k is None else orders[k])
+            note = b.text_input("Note")
+            go = st.form_submit_button("Save stock in", type="primary")
+        if go:
+            problem = None
+            if not qty or qty <= 0:
+                problem = "Enter a quantity above zero."
+            elif not item and not name.strip():
+                problem = "Choose an existing item, or type the new item's name."
+            elif not item and owner == "client" and not client:
+                problem = "Client-owned stock needs the client's name."
+            if problem:
+                st.error(problem)
+            else:
+                try:
+                    if item:
+                        iid = item["item_id"]
+                    else:
+                        rec = {"name": name.strip(), "kind": kind, "ownership": owner,
+                               "unit": "yards" if kind == "fabric" else (unit.strip() or "pcs")}
+                        if owner == "client":
+                            rec["customer_id"] = client
+                        if colour.strip():
+                            rec["colour"] = colour.strip()
+                        if alert:
+                            rec["reorder_level"] = alert
+                        iid = db().table("stock_items").insert(rec).execute().data[0]["id"]
+                    mv = {"item_id": iid, "qty": qty,
+                          "movement_type": {"Opening stock": "opening", "Received / purchased": "in",
+                                            "Adjustment (add)": "adjust_up"}[mtype]}
+                    if order:
+                        mv["order_id"] = order
+                    if note.strip():
+                        mv["note"] = note.strip()
+                    db().table("stock_movements").insert(mv).execute()
+                    done("Stock in saved")
+                except Exception as e:
+                    err(e)
+    st.markdown("**Stock in history**")
+    movement_history(["opening", "in", "adjust_up"])
+
+
+def stock_out():
+    items = [i for i in rows("stock_levels") if float(i["on_hand"]) > 0]
+    orders = look("orders", "id", "order_no")
+    with st.expander("➖ Record stock out", expanded=True):
+        if not items:
+            st.info("Nothing in stock yet. Record stock in first.")
+        with st.form("stock_out", clear_on_submit=True):
+            item = st.selectbox("Item", [None] + items, format_func=lambda i: "—" if i is None else
+                                f"{i['name']} ({i['ownership']}) · {i['on_hand']} {i['unit']} available")
+            a, b = st.columns(2)
+            qty = a.number_input("Quantity taken out (yards for fabric)", value=None, min_value=0.0)
+            reason = b.selectbox("Reason", ["Pulled for use", "Adjustment (damaged / lost)"])
+            order = a.selectbox("For order (optional)", [None] + list(orders),
+                                format_func=lambda k: "—" if k is None else orders[k])
+            note = b.text_input("Note")
+            go = st.form_submit_button("Save stock out", type="primary")
+        if go:
+            if not item or not qty or qty <= 0:
+                st.error("Choose the item and enter a quantity above zero.")
+            else:
+                mv = {"item_id": item["item_id"], "qty": qty,
+                      "movement_type": "out" if reason == "Pulled for use" else "adjust_down"}
+                if order:
+                    mv["order_id"] = order
+                if note.strip():
+                    mv["note"] = note.strip()
+                try:
+                    db().table("stock_movements").insert(mv).execute()
+                    done("Stock out saved. Stock levels are updated.")
+                except Exception as e:
+                    err(e)
+    st.markdown("**Stock out history**")
+    movement_history(["out", "adjust_down"])
+
+
+CUSTOM = {"stock_in": stock_in, "stock_out": stock_out, "fashion_design_changes": design_changes}
 
 
 # ---------------------------------------------------------------- dashboard & board
@@ -272,8 +476,10 @@ def dashboard():
 def board():
     stages = rows("stages", order="position", desc=False)
     orders = rows("orders", "id,order_no,stage,due_date,tracking_token,customers(full_name),"
-                            "fashion_order_details(change_window)", order="due_date", desc=False)
+                            "fashion_order_details(change_window,garment_type)", order="due_date", desc=False)
     keys = [s["key"] for s in stages]
+    pos = {s["key"]: s["position"] for s in stages}
+    cut = pos["cutting"]
     for chunk in (stages[:4], stages[4:]):
         cols = st.columns(len(chunk))
         for col, s in zip(cols, chunk):
@@ -283,10 +489,16 @@ def board():
                 for o in here:
                     det = o.get("fashion_order_details")
                     det = det[0] if isinstance(det, list) and det else det
-                    win = (det or {}).get("change_window", "open")
+                    det = det or {}
+                    # the lock follows the stage: from Cutting onward the design is locked
+                    win = "locked" if pos[o["stage"]] >= cut else \
+                        ("limited" if det.get("change_window") == "limited" else "open")
                     with st.container(border=True):
                         st.write(f"**{o['order_no']}** — {o['customers']['full_name']}")
-                        st.caption(f"Due {o['due_date'] or '—'} · design {win.upper()}")
+                        if det.get("garment_type"):
+                            st.caption(det["garment_type"])
+                        st.caption(f"Due {o['due_date'] or '—'} · " +
+                                   ("🔒 Design locked" if win == "locked" else f"Design {win}"))
                         i = keys.index(s["key"])
                         l, r = st.columns(2)
                         if i > 0 and l.button("‹", key=f"p{o['id']}"):
@@ -305,7 +517,7 @@ def move(order_id, stage):
         db().table("orders").update({"stage": stage}).eq("id", order_id).execute()
         st.rerun()
     except Exception as e:
-        st.error(str(e))
+        err(e)
 
 
 # ---------------------------------------------------------------- app shell
@@ -345,6 +557,9 @@ def main():
         st.warning("Your login has no active staff profile yet. Ask the owner to add you.")
         return
     st.header(section)
+    flash = st.session_state.pop("flash", None)
+    if flash:
+        st.success(flash)
     if section == "Dashboard":
         dashboard()
     elif section == "Production board":
@@ -353,7 +568,7 @@ def main():
         tabs = NAV[section]
         pick = st.radio("View", tabs, format_func=lambda t: CFG[t]["title"], horizontal=True,
                         label_visibility="collapsed") if len(tabs) > 1 else tabs[0]
-        table_view(pick)
+        CUSTOM[pick]() if pick in CUSTOM else table_view(pick)
 
 
 token = st.query_params.get("t")
