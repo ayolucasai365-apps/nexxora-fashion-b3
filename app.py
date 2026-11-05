@@ -616,15 +616,6 @@ STYLE = """
 @media (min-width:769px){[data-testid="stSidebar"]{width:220px !important;min-width:220px !important;max-width:220px !important}}
 [data-testid="stSidebarUserContent"]{padding:1rem .75rem}
 .sum{word-break:break-word}
-[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"]{gap:4px}
-[data-testid="stSidebar"] [data-testid="stRadio"] label{width:100%;margin:0;padding:10px 12px;border-radius:10px;
-  border-left:3px solid transparent;cursor:pointer;transition:background .15s}
-[data-testid="stSidebar"] [data-testid="stRadio"] label>div:first-child{display:none}
-[data-testid="stSidebar"] [data-testid="stRadio"] label:hover{background:#22344a}
-[data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked){background:#2f4d6e;border-left-color:#f5a742;font-weight:600}
-[data-testid="stSidebar"] *{color:#e6edf5}
-[data-testid="stSidebar"] button{background:#22344a;border:1px solid #30465f}
-.sum{background:#1c2f45;border-radius:12px;padding:12px 14px;margin-top:14px;font-size:14px;line-height:1.7}
 .oc{font-size:14px;line-height:1.35}
 .oc .id{font-weight:700;font-size:13px}
 .oc .row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:5px}
@@ -803,8 +794,12 @@ def main():
     me = db().table("profiles").select("full_name,role").eq("id", uid).execute().data
     with st.sidebar:
         st.markdown(f"### {BIZ}")
-        section = st.radio("Menu", list(NAV), label_visibility="collapsed",
-                           format_func=lambda n: f"{ICON.get(n, '•')}  {n}")
+        section = st.session_state.get("section", "Dashboard")
+        for name in NAV:
+            if st.button(f"{ICON.get(name, '•')}  {name}", key=f"nav_{name}", width="stretch",
+                         type="primary" if name == section else "secondary"):
+                st.session_state["section"] = name
+                st.rerun()
         sidebar_summary()
         st.caption(f"{me[0]['full_name']} · {me[0]['role']}" if me else "No staff profile")
         if st.button("Sign out"):
