@@ -616,6 +616,12 @@ STYLE = """
 @media (min-width:769px){[data-testid="stSidebar"]{width:220px !important;min-width:220px !important;max-width:220px !important}}
 [data-testid="stSidebarUserContent"]{padding:1rem .75rem}
 .sum{word-break:break-word}
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"]{gap:4px}
+[data-testid="stSidebar"] [data-testid="stRadio"] label{width:100%;margin:0;padding:10px 12px;border-radius:10px;
+  border-left:3px solid transparent;cursor:pointer;transition:background .15s}
+[data-testid="stSidebar"] [data-testid="stRadio"] label>div:first-child{display:none}
+[data-testid="stSidebar"] [data-testid="stRadio"] label:hover{background:#22344a}
+[data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked){background:#2f4d6e;border-left-color:#f5a742;font-weight:600}
 [data-testid="stSidebar"] *{color:#e6edf5}
 [data-testid="stSidebar"] button{background:#22344a;border:1px solid #30465f}
 .sum{background:#1c2f45;border-radius:12px;padding:12px 14px;margin-top:14px;font-size:14px;line-height:1.7}
