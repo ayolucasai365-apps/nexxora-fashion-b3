@@ -1,5 +1,8 @@
 """Nexxora Business Brain: Fashion branch (staff app + customer tracking page).
 Streamlit + Supabase. Works on phone and desktop (columns stack on narrow screens)."""
+import html
+from datetime import date, timedelta
+
 import pandas as pd
 import streamlit as st
 from supabase import create_client
@@ -95,17 +98,12 @@ CFG = {
            F("original_instructions", "Original instructions (paste WhatsApp text)", "x")],
         d=[F("garment_type", "Garment type"), F("fabric", "Fabric (text description)"), F("style"),
            F("modifications", kind="x"), F("special_requirements", kind="x")]),
+    "customer_details": dict(title="Customer details"),
     "offerings": dict(title="Offerings", order="created_at", cols=["name", "base_price", "description"],
         f=[F("name"), F("base_price", "Base price", "n"), F("description", kind="x")]),
     "customers": dict(title="Customers", order="created_at", cols=["full_name", "phone", "whatsapp", "email"],
         f=[F("full_name", "Name"), F("phone"), F("whatsapp", "WhatsApp"), F("email"),
            F("address"), F("notes", kind="x")]),
-    "fashion_measurements": dict(title="Measurements", order="taken_at",
-        cols=["customer_id", "taken_at", "unit", "measurement_values"],
-        f=[F("customer_id", "Customer", "s", "customers:id:full_name"),
-           F("unit", kind="s", extra=["inches", "cm"], default="inches"),
-           F("measurement_values", "Measurements (e.g. bust=36, waist=28, hip=40)", "j"),
-           F("note")]),
     "fashion_order_details": dict(title="Design details", order=None, up=True, sel="*, orders(stage)",
         cols=["order_id", "garment_type", "fabric", "style", "modifications", "design_window"],
         f=[F("order_id", "Order", "s", "orders:id:order_no"), F("garment_type"),
@@ -176,8 +174,7 @@ CFG = {
 NAV = {
     "Dashboard": None,
     "Orders": ["orders", "offerings"],
-    "Production board": None,
-    "Customers": ["customers", "fashion_measurements"],
+    "Customers": ["customer_details"],
     "Fashion": ["fashion_order_details", "fashion_design_changes", "fashion_qc", "fashion_fittings"],
     "Stock": ["stock_levels", "stock_in", "stock_out"],
     "Ready-to-wear": ["rtw_levels", "rtw_products", "rtw_variants", "rtw_movements", "quick_sales", "quick_sale_items"],
@@ -279,11 +276,13 @@ def list_view(name):
         if col.endswith("_at") or col in ("fitting_date",):
             df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d %b %Y")
     show = [x for x in c["cols"] if x in df]
-    st.dataframe(df[show].rename(columns=lab), use_container_width=True, hide_index=True)
+    st.dataframe(df[show].rename(columns=lab), width="stretch", hide_index=True)
 
 
 def table_view(name):
-    if not CFG[name].get("ro"):
+    if name == "orders":
+        order_form()
+    elif not CFG[name].get("ro"):
         add_form(name)
     if name == "stock_levels":
         st.caption("**Low-stock alert at** is the level that warns you: when the yards on hand fall to this "
@@ -342,7 +341,7 @@ def movement_history(types):
     df["order"] = df["order_id"].map(orders)
     df["date"] = pd.to_datetime(df["created_at"]).dt.strftime("%d %b %Y")
     st.dataframe(df[["item", "movement_type", "qty", "order", "note", "date"]].rename(columns=lab),
-                 use_container_width=True, hide_index=True)
+                 width="stretch", hide_index=True)
 
 
 def stock_in():
@@ -444,72 +443,300 @@ def stock_out():
     movement_history(["out", "adjust_down"])
 
 
-CUSTOM = {"stock_in": stock_in, "stock_out": stock_out, "fashion_design_changes": design_changes}
+# ---------------------------------------------------------------- new order (new or existing customer)
+def order_form():
+    customers = look("customers", "id", "full_name")
+    offerings = look("offerings", "id", "name")
+    stages = look("stages", "key", "label")
+    keys = list(stages)
+    with st.expander("➕ New order"):
+        with st.form("add_orders", clear_on_submit=True):
+            a, b = st.columns(2)
+            cust = a.selectbox("Existing customer", [None] + list(customers),
+                               format_func=lambda k: "—" if k is None else customers[k])
+            newname = b.text_input("…or a NEW customer's name")
+            phone = a.text_input("New customer's phone / WhatsApp (optional)")
+            offering = b.selectbox("Offering", [None] + list(offerings),
+                                   format_func=lambda k: "—" if k is None else offerings[k])
+            due = a.date_input("Due date", value=None)
+            total = b.number_input("Total price", value=None, min_value=0.0)
+            stage = a.selectbox("Stage", keys, index=keys.index("order_received") if "order_received" in keys else 0,
+                                format_func=lambda k: stages[k])
+            instr = st.text_area("Original instructions (paste WhatsApp text)")
+            st.markdown("**Design details**")
+            c, d = st.columns(2)
+            garment = c.text_input("Garment type")
+            fabric = d.text_input("Fabric (text description)")
+            style = c.text_input("Style")
+            mods = d.text_area("Modifications")
+            special = st.text_area("Special requirements")
+            go = st.form_submit_button("Save order", type="primary")
+        if go:
+            problem = None
+            if cust and newname.strip():
+                problem = "Choose an existing customer OR type a new name, not both."
+            elif not cust and not newname.strip():
+                problem = "Choose a customer, or type a new customer's name."
+            if problem:
+                st.error(problem)
+            else:
+                try:
+                    cid, added = cust, False
+                    if not cid:
+                        rec = {"full_name": newname.strip()}
+                        if phone.strip():
+                            rec["phone"] = phone.strip()
+                            rec["whatsapp"] = phone.strip()
+                        cid = db().table("customers").insert(rec).execute().data[0]["id"]
+                        added = True
+                    order = {"customer_id": cid, "stage": stage}
+                    if offering:
+                        order["offering_id"] = offering
+                    if due:
+                        order["due_date"] = due.isoformat()
+                    if total:
+                        order["total_amount"] = total
+                    if instr.strip():
+                        order["original_instructions"] = instr.strip()
+                    res = db().table("orders").insert(order).execute()
+                    det = {k: v.strip() for k, v in [("garment_type", garment), ("fabric", fabric), ("style", style),
+                                                     ("modifications", mods), ("special_requirements", special)]
+                           if v and v.strip()}
+                    if det:
+                        db().table("fashion_order_details").upsert({"order_id": res.data[0]["id"], **det}).execute()
+                    done("Order saved" + (" and the new customer was added." if added else "."))
+                except Exception as e:
+                    err(e)
+
+
+# ---------------------------------------------------------------- customer details (profile + measurements per attire)
+MEAS = ["Neck", "Shoulder", "Chest / Bust", "Waist", "Hip", "Sleeve length", "Round sleeve", "Armhole",
+        "Top length", "Trouser / skirt length", "Thigh", "Knee", "Ankle / bottom", "Inseam"]
+
+
+def customer_details():
+    add_form("customers")
+    custs = rows("customers", "id,full_name,phone,whatsapp,email,address,notes", order="full_name", desc=False)
+    if not custs:
+        st.info("No customers yet. Add the first one above.")
+        return
+    q = st.text_input("Search customers", placeholder="Name or phone").strip().lower()
+    shown = [c for c in custs if q in f"{c['full_name']} {c['phone'] or ''}".lower()] if q else custs
+    if not shown:
+        st.info("No customer matches that search.")
+        return
+    pick = st.selectbox("Customer", shown, format_func=lambda c: c["full_name"] + (f" · {c['phone']}" if c["phone"] else ""))
+    st.subheader(pick["full_name"])
+    bits = [x for x in [pick.get("phone"), pick.get("whatsapp"), pick.get("email"), pick.get("address")] if x]
+    if bits:
+        st.caption("  ·  ".join(dict.fromkeys(bits)))
+    if pick.get("notes"):
+        st.write(pick["notes"])
+
+    st.markdown("### Measurements")
+    sets = (db().table("fashion_measurements").select("*").eq("customer_id", pick["id"])
+            .order("taken_at", desc=True).execute().data)
+    for m in sets:
+        title = f"{m.get('attire') or 'Measurements'} · {m['taken_at']} · {m['unit']}"
+        with st.expander(title):
+            vals = m.get("measurement_values") or {}
+            if vals:
+                st.dataframe(pd.DataFrame(list(vals.items()), columns=["Measurement", m["unit"]]),
+                             width="stretch", hide_index=True)
+            if m.get("note"):
+                st.caption(m["note"])
+    if not sets:
+        st.info("No measurements yet. Add the first set below.")
+    label = "➕ Add new measurements (another attire)" if sets else "➕ Add first measurements"
+    with st.expander(label, expanded=not sets):
+        with st.form(f"meas_{pick['id']}", clear_on_submit=True):
+            a, b = st.columns(2)
+            attire = a.text_input("Attire / garment (e.g. Agbada, Gown, Suit)")
+            unit = b.selectbox("Unit", ["inches", "cm"])
+            table = pd.DataFrame({"Measurement": MEAS, "Value": pd.Series([None] * len(MEAS), dtype="float64")})
+            edited = st.data_editor(table, num_rows="dynamic", hide_index=True, width="stretch",
+                                    column_config={"Value": st.column_config.NumberColumn(min_value=0.0, step=0.1)},
+                                    key=f"ed_{pick['id']}_{len(sets)}")
+            st.caption("Fill only what this attire needs. Add your own rows at the bottom of the table.")
+            note = st.text_input("Note")
+            go = st.form_submit_button("Save measurements", type="primary")
+        if go:
+            vals = {}
+            for _, r in edited.iterrows():
+                name, v = r["Measurement"], r["Value"]
+                if name and str(name).strip() and pd.notna(v):
+                    vals[str(name).strip()] = int(v) if float(v).is_integer() else float(v)
+            if not vals:
+                st.error("Enter at least one measurement.")
+            else:
+                rec = {"customer_id": pick["id"], "unit": unit, "measurement_values": vals}
+                if attire.strip():
+                    rec["attire"] = attire.strip()
+                if note.strip():
+                    rec["note"] = note.strip()
+                try:
+                    db().table("fashion_measurements").insert(rec).execute()
+                    done("Measurements saved")
+                except Exception as e:
+                    err(e)
+
+    st.markdown("### Orders")
+    stage_names = look("stages", "key", "label")
+    orders = (db().table("orders").select("order_no,stage,due_date,total_amount").eq("customer_id", pick["id"])
+              .order("created_at", desc=True).execute().data)
+    if orders:
+        df = pd.DataFrame(orders)
+        df["stage"] = df["stage"].map(stage_names)
+        st.dataframe(df.rename(columns=lab), width="stretch", hide_index=True)
+    else:
+        st.caption("No orders yet for this customer.")
+
+
+CUSTOM = {"customer_details": customer_details, "stock_in": stock_in, "stock_out": stock_out, "fashion_design_changes": design_changes}
 
 
 # ---------------------------------------------------------------- dashboard & board
+STYLE = """
+<style>
+[data-testid="stSidebar"]{background:#14202e}
+[data-testid="stSidebar"] *{color:#e6edf5}
+[data-testid="stSidebar"] button{background:#22344a;border:1px solid #30465f}
+.sum{background:#1c2f45;border-radius:12px;padding:12px 14px;margin-top:14px;font-size:14px;line-height:1.7}
+.oc{font-size:14px;line-height:1.35}
+.oc .id{font-weight:700;font-size:13px}
+.oc .row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:5px}
+.oc .sub{opacity:.75;font-size:12.5px}
+.oc .price{font-weight:700}
+.bdg{padding:1px 9px;border-radius:6px;font-size:12px;font-weight:600}
+.b-paid{background:#d4edda;color:#1e6b34}.b-unpaid{background:#fde9b8;color:#8a5a00}.b-part{background:#d7e6fb;color:#1f4f99}
+.bar{height:4px;background:rgba(128,128,128,.25);border-radius:9px;margin-top:9px;overflow:hidden}
+.bar>span{display:block;height:100%;border-radius:9px}
+.coltitle{font-weight:600;margin:4px 0 8px}
+</style>
+"""
+SYM = {"NGN": "₦", "USD": "$", "GBP": "£", "EUR": "€", "GHS": "₵", "KES": "KSh "}
+COLORS = ["#3b82f6", "#06b6d4", "#f59e0b", "#fb923c", "#a855f7", "#ec4899", "#22c55e", "#10b981"]
+BADGE = {"unpaid": ("Unpaid", "b-unpaid"), "partially_paid": ("Part paid", "b-part"), "fully_paid": ("Paid", "b-paid")}
+
+
+def currency():
+    cur = next((r["value"] for r in rows("settings") if r["key"] == "currency"), "NGN")
+    return SYM.get(cur, f"{cur} ")
+
+
+def card_html(o, det, bal, pct, color, sym):
+    badge = BADGE.get(bal.get("payment_status", "unpaid"), BADGE["unpaid"])
+    due = f"Due {o['due_date']}" if o.get("due_date") else "No due date"
+    garment = html.escape(det.get("garment_type") or "—")
+    return (f'<div class="oc"><div class="id">{html.escape(o["order_no"])}</div>'
+            f'<div class="row"><span>👤 {html.escape(o["customers"]["full_name"])}</span>'
+            f'<span class="price">{sym}{float(o["total_amount"] or 0):,.0f}</span></div>'
+            f'<div class="row sub"><span>📅 {due}</span></div>'
+            f'<div class="row sub"><span>🧵 {garment}</span>'
+            f'<span class="bdg {badge[1]}">{badge[0]}</span></div>'
+            f'<div class="bar"><span style="width:{pct}%;background:{color}"></span></div></div>')
+
+
 def dashboard():
-    orders = rows("orders", "stage")
-    alerts = rows("alerts_orders")
-    low_f, low_r = rows("alerts_low_stock"), rows("alerts_low_rtw")
-    active = sum(1 for o in orders if o["stage"] != "delivered")
-    a, b, c, d, e = st.columns(5)
-    a.metric("Active orders", active)
-    b.metric("Delayed", sum(1 for x in alerts if x["alert"] == "delayed"))
-    c.metric("Due soon", sum(1 for x in alerts if x["alert"] == "due_soon"))
-    d.metric("Low fabric/material", len(low_f))
-    e.metric("Low ready-to-wear", len(low_r))
-    if alerts:
-        st.markdown("**Orders needing attention**")
-        st.dataframe(pd.DataFrame(alerts)[["order_no", "customer", "due_date", "stage", "alert"]]
-                     .rename(columns=lab), use_container_width=True, hide_index=True)
-    if low_f:
-        st.markdown("**Low fabric / material**")
-        st.dataframe(pd.DataFrame(low_f)[["name", "ownership", "on_hand", "unit", "reorder_level"]]
-                     .rename(columns=lab), use_container_width=True, hide_index=True)
-    if low_r:
-        st.markdown("**Low ready-to-wear**")
-        st.dataframe(pd.DataFrame(low_r)[["sku", "name", "size", "colour", "on_hand"]]
-                     .rename(columns=lab), use_container_width=True, hide_index=True)
-
-
-def board():
+    sym = currency()
     stages = rows("stages", order="position", desc=False)
-    orders = rows("orders", "id,order_no,stage,due_date,tracking_token,customers(full_name),"
-                            "fashion_order_details(change_window,garment_type)", order="due_date", desc=False)
     keys = [s["key"] for s in stages]
+    labels = {s["key"]: s["label"] for s in stages}
     pos = {s["key"]: s["position"] for s in stages}
     cut = pos["cutting"]
-    for chunk in (stages[:4], stages[4:]):
-        cols = st.columns(len(chunk))
+    orders = rows("orders", "id,order_no,stage,order_date,due_date,total_amount,tracking_token,"
+                            "customers(full_name),fashion_order_details(change_window,garment_type)",
+                  order="due_date", desc=False)
+    bal = {b["order_id"]: b for b in rows("order_balances")}
+
+    order_form()
+    f1, f2, f3, f4 = st.columns([5, 2, 2, 1])
+    q = f1.text_input("Search", placeholder="🔍 Search orders, customers, or ID",
+                      label_visibility="collapsed").strip().lower()
+    when = f2.selectbox("When", ["All dates", "Ordered today", "Due this week", "Overdue"],
+                        label_visibility="collapsed")
+    stf = f3.selectbox("Status", [None] + keys, label_visibility="collapsed",
+                       format_func=lambda k: "All statuses" if k is None else labels[k])
+    f4.button("↻", help="Refresh")
+
+    today = date.today()
+
+    def keep(o):
+        det = o.get("fashion_order_details")
+        det = det[0] if isinstance(det, list) and det else (det or {})
+        hay = f"{o['order_no']} {o['customers']['full_name']} {det.get('garment_type') or ''}".lower()
+        if q and q not in hay:
+            return False
+        due = date.fromisoformat(o["due_date"]) if o.get("due_date") else None
+        if when == "Ordered today":
+            return o.get("order_date") == today.isoformat()
+        if when == "Due this week":
+            return due is not None and today <= due <= today + timedelta(days=7)
+        if when == "Overdue":
+            return due is not None and due < today and o["stage"] != keys[-1]
+        return True
+
+    shown = [o for o in orders if keep(o)]
+    cols_stages = [s for s in stages if stf in (None, s["key"])]
+    for r in range(0, len(cols_stages), 4):
+        chunk = cols_stages[r:r + 4]
+        cols = st.columns(4)
         for col, s in zip(cols, chunk):
-            here = [o for o in orders if o["stage"] == s["key"]]
+            here = [o for o in shown if o["stage"] == s["key"]]
+            color = COLORS[(s["position"] - 1) % len(COLORS)]
             with col:
-                st.markdown(f"**{s['label']}** · {len(here)}")
+                st.markdown(f'<div class="coltitle"><span style="color:{color}">●</span> {s["label"]} '
+                            f'<span style="opacity:.6">({len(here)})</span></div>', unsafe_allow_html=True)
                 for o in here:
                     det = o.get("fashion_order_details")
-                    det = det[0] if isinstance(det, list) and det else det
-                    det = det or {}
-                    # the lock follows the stage: from Cutting onward the design is locked
+                    det = det[0] if isinstance(det, list) and det else (det or {})
                     win = "locked" if pos[o["stage"]] >= cut else \
                         ("limited" if det.get("change_window") == "limited" else "open")
+                    pct = round(100 * pos[o["stage"]] / len(stages))
                     with st.container(border=True):
-                        st.write(f"**{o['order_no']}** — {o['customers']['full_name']}")
-                        if det.get("garment_type"):
-                            st.caption(det["garment_type"])
-                        st.caption(f"Due {o['due_date'] or '—'} · " +
-                                   ("🔒 Design locked" if win == "locked" else f"Design {win}"))
+                        st.markdown(card_html(o, det, bal.get(o["id"], {}), pct, color, sym), unsafe_allow_html=True)
                         i = keys.index(s["key"])
-                        l, r = st.columns(2)
-                        if i > 0 and l.button("‹", key=f"p{o['id']}"):
+                        l, m, rr = st.columns(3)
+                        if i > 0 and l.button("‹", key=f"p{o['id']}", help="Move back a stage"):
                             move(o["id"], keys[i - 1])
-                        if i < len(keys) - 1 and r.button("›", key=f"n{o['id']}"):
+                        with m.popover("⋮"):
+                            st.caption("🔒 Design locked" if win == "locked" else f"Design {win}")
+                            st.caption("Customer tracking link")
+                            st.code(f"{APP_URL}/?t={o['tracking_token']}")
+                        if i < len(keys) - 1 and rr.button("›", key=f"n{o['id']}", help="Move to next stage"):
                             move(o["id"], keys[i + 1])
-    st.divider()
-    pick = st.selectbox("Customer tracking link for order", [None] + orders,
-                        format_func=lambda o: "—" if o is None else f"{o['order_no']} — {o['customers']['full_name']}")
-    if pick:
-        st.code(f"{APP_URL}/?t={pick['tracking_token']}")
+    if not shown:
+        st.info("No orders match. Add one with ➕ New order.")
+
+    with st.expander("⚠ Alerts"):
+        alerts = rows("alerts_orders")
+        low_f, low_r = rows("alerts_low_stock"), rows("alerts_low_rtw")
+        a, b, c = st.columns(3)
+        a.metric("Delayed / due soon", len(alerts))
+        b.metric("Low fabric / material", len(low_f))
+        c.metric("Low ready-to-wear", len(low_r))
+        if alerts:
+            st.dataframe(pd.DataFrame(alerts)[["order_no", "customer", "due_date", "stage", "alert"]]
+                         .rename(columns=lab), width="stretch", hide_index=True)
+        if low_f:
+            st.dataframe(pd.DataFrame(low_f)[["name", "ownership", "on_hand", "unit", "reorder_level"]]
+                         .rename(columns=lab), width="stretch", hide_index=True)
+        if low_r:
+            st.dataframe(pd.DataFrame(low_r)[["sku", "name", "size", "colour", "on_hand"]]
+                         .rename(columns=lab), width="stretch", hide_index=True)
+
+
+def sidebar_summary():
+    try:
+        sym = currency()
+        active = sum(1 for o in rows("orders", "stage") if o["stage"] != "delivered")
+        delayed = sum(1 for a in rows("alerts_orders") if a["alert"] == "delayed")
+        paid = sum(float(p["amount"]) for p in db().table("payments").select("amount")
+                   .gte("paid_at", date.today().isoformat()).execute().data)
+        st.markdown(f'<div class="sum"><b>Today\'s Summary</b><br>📋 {active} active orders<br>'
+                    f'⚠ {delayed} delayed<br>💵 {sym}{paid:,.0f} received today</div>', unsafe_allow_html=True)
+    except Exception:
+        pass
 
 
 def move(order_id, stage):
@@ -543,12 +770,19 @@ def login():
                 st.exception(e)
 
 
+ICON = {"Dashboard": "▦", "Orders": "🛍", "Customers": "👥", "Fashion": "🧵", "Stock": "📦",
+        "Ready-to-wear": "👗", "Money": "💳", "Team": "🧑‍🤝‍🧑"}
+
+
 def main():
+    st.markdown(STYLE, unsafe_allow_html=True)
     uid = db().auth.get_user().user.id
     me = db().table("profiles").select("full_name,role").eq("id", uid).execute().data
     with st.sidebar:
         st.markdown(f"### {BIZ}")
-        section = st.radio("Menu", list(NAV), label_visibility="collapsed")
+        section = st.radio("Menu", list(NAV), label_visibility="collapsed",
+                           format_func=lambda n: f"{ICON.get(n, '•')}  {n}")
+        sidebar_summary()
         st.caption(f"{me[0]['full_name']} · {me[0]['role']}" if me else "No staff profile")
         if st.button("Sign out"):
             st.session_state.pop("sb")
@@ -562,8 +796,6 @@ def main():
         st.success(flash)
     if section == "Dashboard":
         dashboard()
-    elif section == "Production board":
-        board()
     else:
         tabs = NAV[section]
         pick = st.radio("View", tabs, format_func=lambda t: CFG[t]["title"], horizontal=True,
