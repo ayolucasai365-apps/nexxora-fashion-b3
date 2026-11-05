@@ -1,7 +1,7 @@
 """Nexxora Business Brain: Fashion branch (staff app + customer tracking page).
 Streamlit + Supabase. Works on phone and desktop (columns stack on narrow screens)."""
 import html
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -15,6 +15,13 @@ APP_URL = st.secrets.get("APP_URL", "").rstrip("/")
 
 
 # ---------------------------------------------------------------- tracking page
+def fmt_date(v):
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).strftime("%d %b %Y")
+    except Exception:
+        return "—"
+
+
 def tracking(token: str):
     o = create_client(URL, KEY).rpc("get_order_tracking", {"p_token": token}).execute().data
     _, mid, _ = st.columns([1, 2, 1])
@@ -28,12 +35,19 @@ def tracking(token: str):
         st.markdown(f"### {o['stage_label']}")
         st.progress(int(o["progress_pct"]) / 100, text=f"{int(o['progress_pct'])}% complete")
         a, b = st.columns(2)
-        a.metric("Expected", (o.get("expected_date") or "—"))
-        b.metric("Last updated", (o.get("last_updated") or "—")[:10])
-        if o.get("timeline"):
+        a.markdown(f"**Expected**  \n{fmt_date(o.get('expected_date'))}")
+        b.markdown(f"**Last updated**  \n{fmt_date(o.get('last_updated'))}")
+        steps = o.get("steps") or []
+        if steps:
             st.markdown("**Progress**")
-            for t in o["timeline"]:
-                st.write(f"• {t['label']}  ·  {t['at'][:10]}")
+            for step in steps:
+                when = f" · {fmt_date(step['at'])}" if step.get("at") else ""
+                if step["state"] == "done":
+                    st.write(f"✅ {step['label']}{when}")
+                elif step["state"] == "current":
+                    st.write(f"🟠 **{step['label']}**{when}  ← now")
+                else:
+                    st.write(f"⚪ {step['label']}")
 
 
 # ---------------------------------------------------------------- helpers
