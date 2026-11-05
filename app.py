@@ -303,6 +303,8 @@ def table_view(name):
                    "number or below, the item shows LOW and appears on the dashboard. "
                    "It is not an amount you take out; use the Stock out tab for that.")
     list_view(name)
+    if name == "orders":
+        order_edit()
 
 
 # ---------------------------------------------------------------- design changes (locks at Cutting)
@@ -604,6 +606,83 @@ def customer_details():
         st.dataframe(df.rename(columns=lab), width="stretch", hide_index=True)
     else:
         st.caption("No orders yet for this customer.")
+
+
+# ---------------------------------------------------------------- edit or delete an order
+def order_edit():
+    sym = currency()
+    orders = rows("orders", "id,order_no,customer_id,offering_id,due_date,total_amount,original_instructions,"
+                            "customers(full_name),fashion_order_details(garment_type,fabric,style,modifications,"
+                            "special_requirements)", order="created_at")
+    if not orders:
+        return
+    customers = look("customers", "id", "full_name")
+    offerings = look("offerings", "id", "name")
+    st.divider()
+    st.markdown("### ✏️ Edit or delete an order")
+    pick = st.selectbox("Choose the order", [None] + orders, key="edit_pick",
+                        format_func=lambda o: "—" if o is None else
+                        f"{o['order_no']} — {o['customers']['full_name']} — {sym}{float(o['total_amount'] or 0):,.0f}")
+    if not pick:
+        return
+    det = pick.get("fashion_order_details")
+    det = det[0] if isinstance(det, list) and det else (det or {})
+    cust_keys = list(customers)
+    off_keys = [None] + list(offerings)
+    with st.form(f"edit_order_{pick['id']}"):
+        a, b = st.columns(2)
+        cust = a.selectbox("Customer", cust_keys, format_func=lambda k: customers[k],
+                           index=cust_keys.index(pick.get("customer_id")) if pick.get("customer_id") in cust_keys else 0)
+        offering = b.selectbox("Offering", off_keys, format_func=lambda k: "—" if k is None else offerings[k],
+                               index=off_keys.index(pick.get("offering_id")) if pick.get("offering_id") in off_keys else 0)
+        due = a.date_input("Due date", value=date.fromisoformat(pick["due_date"]) if pick.get("due_date") else None)
+        total = b.number_input("Total price", min_value=0.0,
+                               value=float(pick["total_amount"]) if pick["total_amount"] is not None else None)
+        instr = st.text_area("Original instructions", value=pick.get("original_instructions") or "")
+        st.markdown("**Design details**")
+        c, d = st.columns(2)
+        garment = c.text_input("Garment type", value=det.get("garment_type") or "")
+        fabric = d.text_input("Fabric (text description)", value=det.get("fabric") or "")
+        style = c.text_input("Style", value=det.get("style") or "")
+        mods = d.text_area("Modifications", value=det.get("modifications") or "")
+        special = st.text_area("Special requirements", value=det.get("special_requirements") or "")
+        save = st.form_submit_button("Save changes", type="primary")
+    if save:
+        try:
+            db().table("orders").update({
+                "customer_id": cust, "offering_id": offering,
+                "due_date": due.isoformat() if due else None,
+                "total_amount": float(total) if total is not None else 0,
+                "original_instructions": instr.strip() or None}).eq("id", pick["id"]).execute()
+            db().table("fashion_order_details").upsert({
+                "order_id": pick["id"], "garment_type": garment.strip() or None, "fabric": fabric.strip() or None,
+                "style": style.strip() or None, "modifications": mods.strip() or None,
+                "special_requirements": special.strip() or None}).execute()
+            done(f"{pick['order_no']} updated")
+        except Exception as e:
+            err(e)
+
+    with st.expander("🗑 Delete this order"):
+        pays = db().table("payments").select("amount").eq("order_id", pick["id"]).execute().data
+        paid = sum(float(p["amount"]) for p in pays)
+        st.warning(
+            f"Deleting {pick['order_no']} removes the order and everything attached to it: its design details, "
+            "quality control, fittings, work updates, status history and recorded payments"
+            + (f" ({len(pays)} payment(s), {sym}{paid:,.0f} in total)" if pays else "") +
+            ". The customer and their measurements stay exactly as they are. This cannot be undone.")
+        typed = st.text_input("Type the order number to confirm", key=f"del_{pick['id']}")
+        if st.button("Delete order", type="primary", key=f"delbtn_{pick['id']}"):
+            if typed.strip().upper() != pick["order_no"].upper():
+                st.error("The order number you typed doesn't match.")
+            else:
+                try:
+                    gone = db().table("orders").delete().eq("id", pick["id"]).execute().data
+                    if gone:
+                        done(f"{pick['order_no']} deleted. The customer is unchanged.")
+                    else:
+                        st.error("Only an owner or manager can delete orders.")
+                except Exception as e:
+                    err(e)
 
 
 CUSTOM = {"customer_details": customer_details, "stock_in": stock_in, "stock_out": stock_out, "fashion_design_changes": design_changes}
