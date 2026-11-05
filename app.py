@@ -613,6 +613,9 @@ CUSTOM = {"customer_details": customer_details, "stock_in": stock_in, "stock_out
 STYLE = """
 <style>
 [data-testid="stSidebar"]{background:#14202e}
+@media (min-width:769px){[data-testid="stSidebar"]{width:220px !important;min-width:220px !important;max-width:220px !important}}
+[data-testid="stSidebarUserContent"]{padding:1rem .75rem}
+.sum{word-break:break-word}
 [data-testid="stSidebar"] *{color:#e6edf5}
 [data-testid="stSidebar"] button{background:#22344a;border:1px solid #30465f}
 .sum{background:#1c2f45;border-radius:12px;padding:12px 14px;margin-top:14px;font-size:14px;line-height:1.7}
