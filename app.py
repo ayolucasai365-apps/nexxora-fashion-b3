@@ -615,7 +615,20 @@ STYLE = """
 [data-testid="stSidebar"]{background:#14202e}
 @media (min-width:769px){[data-testid="stSidebar"]{width:220px !important;min-width:220px !important;max-width:220px !important}}
 [data-testid="stSidebarUserContent"]{padding:1rem .75rem}
-.sum{word-break:break-word}
+[data-testid="stSidebar"] *{color:#e6edf5}
+[data-testid="stSidebar"] [data-testid="stVerticalBlock"]{gap:.15rem}
+[data-testid="stSidebar"] button{background:transparent !important;border:none !important;border-radius:0 !important;
+  box-shadow:none !important;color:#e6edf5 !important;justify-content:flex-start !important;
+  padding:.6rem .9rem !important;min-height:0}
+[data-testid="stSidebar"] button p{margin:0;font-size:15px;text-align:left}
+[data-testid="stSidebar"] button:hover{background:rgba(255,255,255,.08) !important}
+[data-testid="stSidebar"] button[kind="primary"],[data-testid="stSidebar"] [data-testid="stBaseButton-primary"]{
+  background:rgba(255,255,255,.16) !important;font-weight:600}
+[data-testid="stSidebar"] .brand{background:#243a52;border:1px solid #3a5876;border-radius:12px;padding:10px 14px;
+  margin-bottom:10px;font-size:20px;font-weight:700;letter-spacing:.05em;color:#ffffff}
+[data-testid="stSidebar"] .sum{background:#243a52;border:1px solid #3a5876;border-radius:12px;padding:12px 14px;
+  margin-top:14px;font-size:14px;line-height:1.7;color:#f1f5f9;word-break:break-word}
+[data-testid="stSidebar"] .who{margin:10px 2px 6px;font-size:13px;color:#b9c6d6}
 .oc{font-size:14px;line-height:1.35}
 .oc .id{font-weight:700;font-size:13px}
 .oc .row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:5px}
@@ -793,7 +806,7 @@ def main():
     uid = db().auth.get_user().user.id
     me = db().table("profiles").select("full_name,role").eq("id", uid).execute().data
     with st.sidebar:
-        st.markdown(f"### {BIZ}")
+        st.markdown(f'<div class="brand">{html.escape(BIZ)}</div>', unsafe_allow_html=True)
         section = st.session_state.get("section", "Dashboard")
         for name in NAV:
             if st.button(f"{ICON.get(name, '•')}  {name}", key=f"nav_{name}", width="stretch",
@@ -801,7 +814,8 @@ def main():
                 st.session_state["section"] = name
                 st.rerun()
         sidebar_summary()
-        st.caption(f"{me[0]['full_name']} · {me[0]['role']}" if me else "No staff profile")
+        who = f"{me[0]['full_name']} · {me[0]['role']}" if me else "No staff profile"
+        st.markdown(f'<div class="who">{html.escape(who)}</div>', unsafe_allow_html=True)
         if st.button("Sign out"):
             st.session_state.pop("sb")
             st.rerun()
