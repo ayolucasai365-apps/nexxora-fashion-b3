@@ -67,6 +67,14 @@ def look(table, val, label):
     return {r[val]: r[label] for r in q.execute().data}
 
 
+def is_staff_role():
+    return st.session_state.get("me", {}).get("role") == "staff"
+
+
+def order_names():
+    return {o["id"]: o["order_no"] for o in rows("my_orders", "id,order_no")}
+
+
 LAB = {"reorder_level": "Low-stock alert at", "on_hand": "On hand",
        "delivery_impact_days": "Delivery impact (days)", "design_window": "Design window"}
 
@@ -113,6 +121,8 @@ CFG = {
         d=[F("garment_type", "Garment type"), F("fabric", "Fabric (text description)"), F("style"),
            F("modifications", kind="x"), F("special_requirements", kind="x")]),
     "customer_details": dict(title="Customer details"),
+    "staff_page": dict(title="Staff"),
+    "my_account": dict(title="My account"),
     "offerings": dict(title="Offerings", order="created_at", cols=["name", "base_price", "description"],
         f=[F("name"), F("base_price", "Base price", "n"), F("description", kind="x")]),
     "customers": dict(title="Customers", order="created_at", cols=["full_name", "phone", "whatsapp", "email"],
@@ -193,7 +203,13 @@ NAV = {
     "Stock": ["stock_levels", "stock_in", "stock_out"],
     "Ready-to-wear": ["rtw_levels", "rtw_products", "rtw_variants", "rtw_movements", "quick_sales", "quick_sale_items"],
     "Money": ["payments", "order_balances", "expenses"],
-    "Team": ["work_updates", "attendance", "communications", "message_templates"],
+    "Team": ["staff_page", "work_updates", "attendance", "communications", "message_templates"],
+}
+
+NAV_STAFF = {
+    "My tasks": None,
+    "Stock": ["stock_levels", "stock_out"],
+    "My account": ["my_account"],
 }
 
 
@@ -346,7 +362,7 @@ def design_changes():
 # ---------------------------------------------------------------- stock in / out
 def movement_history(types):
     items = look("stock_items", "id", "name")
-    orders = look("orders", "id", "order_no")
+    orders = order_names()
     data = (db().table("stock_movements").select("*").in_("movement_type", types)
             .order("created_at", desc=True).limit(200).execute().data)
     if not data:
@@ -363,7 +379,7 @@ def movement_history(types):
 def stock_in():
     items = rows("stock_levels")
     clients = look("customers", "id", "full_name")
-    orders = look("orders", "id", "order_no")
+    orders = order_names()
     with st.expander("➕ Record stock in", expanded=True):
         with st.form("stock_in", clear_on_submit=True):
             item = st.selectbox("Existing item", [None] + items, format_func=lambda i: "— new item: fill the details below —"
@@ -426,7 +442,7 @@ def stock_in():
 
 def stock_out():
     items = [i for i in rows("stock_levels") if float(i["on_hand"]) > 0]
-    orders = look("orders", "id", "order_no")
+    orders = order_names()
     with st.expander("➖ Record stock out", expanded=True):
         if not items:
             st.info("Nothing in stock yet. Record stock in first.")
@@ -435,7 +451,8 @@ def stock_out():
                                 f"{i['name']} ({i['ownership']}) · {i['on_hand']} {i['unit']} available")
             a, b = st.columns(2)
             qty = a.number_input("Quantity taken out (yards for fabric)", value=None, min_value=0.0)
-            reason = b.selectbox("Reason", ["Pulled for use", "Adjustment (damaged / lost)"])
+            reason = b.selectbox("Reason", ["Pulled for use"] if is_staff_role()
+                                 else ["Pulled for use", "Adjustment (damaged / lost)"])
             order = a.selectbox("For order (optional)", [None] + list(orders),
                                 format_func=lambda k: "—" if k is None else orders[k])
             note = b.text_input("Note")
@@ -662,6 +679,25 @@ def order_edit():
         except Exception as e:
             err(e)
 
+    with st.expander("👷 Assigned staff"):
+        people = [p for p in rows("profiles", "id,full_name,responsibility,active", order="full_name", desc=False)
+                  if p["active"]]
+        names = {p["id"]: p["full_name"] + (f" · {p['responsibility']}" if p.get("responsibility") else "")
+                 for p in people}
+        current = [a["staff_id"] for a in db().table("order_assignments").select("staff_id")
+                   .eq("order_id", pick["id"]).execute().data]
+        chosen = st.multiselect("Staff working on this order", list(names), default=[c for c in current if c in names],
+                                format_func=lambda k: names[k], key=f"assign_{pick['id']}")
+        if st.button("Save assignment", key=f"assignbtn_{pick['id']}"):
+            try:
+                db().table("order_assignments").delete().eq("order_id", pick["id"]).execute()
+                if chosen:
+                    db().table("order_assignments").insert(
+                        [{"order_id": pick["id"], "staff_id": k} for k in chosen]).execute()
+                done("Assignment saved")
+            except Exception as e:
+                err(e)
+
     with st.expander("🗑 Delete this order"):
         pays = db().table("payments").select("amount").eq("order_id", pick["id"]).execute().data
         paid = sum(float(p["amount"]) for p in pays)
@@ -685,7 +721,186 @@ def order_edit():
                     err(e)
 
 
-CUSTOM = {"customer_details": customer_details, "stock_in": stock_in, "stock_out": stock_out, "fashion_design_changes": design_changes}
+# ---------------------------------------------------------------- staff, my account, my tasks
+RESPS = ["Cutter", "Tailor", "Fitter", "Quality control", "Sales / front desk", "Stock keeper", "Other"]
+ROLE_LABEL = {"owner": "Owner", "manager": "Manager", "staff": "General staff"}
+
+
+def password_box(key):
+    with st.expander("🔑 Change my password"):
+        with st.form(f"pw_{key}", clear_on_submit=True):
+            p1 = st.text_input("New password", type="password")
+            p2 = st.text_input("Repeat new password", type="password")
+            go = st.form_submit_button("Change password", type="primary")
+        if go:
+            if len(p1) < 8:
+                st.error("Use at least 8 characters.")
+            elif p1 != p2:
+                st.error("The two passwords don't match.")
+            else:
+                try:
+                    db().auth.update_user({"password": p1})
+                    st.success("Password changed.")
+                except Exception as e:
+                    err(e)
+
+
+def my_account():
+    me = st.session_state["me"]
+    st.subheader(me["full_name"])
+    st.caption(ROLE_LABEL.get(me["role"], me["role"]) + (f" · {me['responsibility']}" if me.get("responsibility") else ""))
+    password_box("account")
+
+
+def staff_page():
+    me = st.session_state["me"]
+    owner = me["role"] == "owner"
+    people = rows("profiles", "id,full_name,phone,role,responsibility,active", order="full_name", desc=False)
+    with st.expander("➕ Add staff"):
+        with st.form("add_staff", clear_on_submit=True):
+            a, b = st.columns(2)
+            name = a.text_input("Full name")
+            email = b.text_input("Email (this is their login)")
+            pw = a.text_input("Temporary password (at least 8 characters)", type="password")
+            phone = b.text_input("Phone")
+            role = a.selectbox("Access level", ["staff", "manager", "owner"] if owner else ["staff"],
+                               format_func=lambda r: ROLE_LABEL[r])
+            resp = b.selectbox("Responsibility", RESPS)
+            go = st.form_submit_button("Create login", type="primary")
+        st.caption("Give them the email and temporary password privately, and ask them to change it under My account.")
+        if go:
+            if not name.strip() or "@" not in email or len(pw) < 8:
+                st.error("Enter the name, a valid email and a password of at least 8 characters.")
+            else:
+                try:
+                    user = create_client(URL, KEY).auth.sign_up({"email": email.strip(), "password": pw}).user
+                    ids = getattr(user, "identities", None)
+                    if not user or not getattr(user, "id", None) or (ids is not None and len(ids) == 0):
+                        st.error("That email already has a login. Ask an owner to fix it in Supabase.")
+                    else:
+                        rec = {"id": user.id, "full_name": name.strip(), "role": role, "responsibility": resp}
+                        if phone.strip():
+                            rec["phone"] = phone.strip()
+                        db().table("profiles").insert(rec).execute()
+                        done(f"{name.strip()} added. If they cannot sign in, check that 'Confirm email' is switched "
+                             "off in Supabase under Authentication.")
+                except Exception as e:
+                    err(e)
+    if not people:
+        return
+    df = pd.DataFrame(people)
+    df["role"] = df["role"].map(ROLE_LABEL)
+    df["active"] = df["active"].map({True: "Active", False: "Switched off"})
+    st.dataframe(df[["full_name", "role", "responsibility", "phone", "active"]].rename(columns=lab),
+                 width="stretch", hide_index=True)
+    st.markdown("### Edit a staff member")
+    pick = st.selectbox("Choose", people, format_func=lambda p: p["full_name"], key="staff_pick")
+    resp_opts = RESPS + ([pick["responsibility"]] if pick.get("responsibility") and pick["responsibility"] not in RESPS else [])
+    with st.form(f"edit_staff_{pick['id']}"):
+        a, b = st.columns(2)
+        name = a.text_input("Full name", value=pick["full_name"])
+        phone = b.text_input("Phone", value=pick.get("phone") or "")
+        resp = a.selectbox("Responsibility", resp_opts,
+                           index=resp_opts.index(pick["responsibility"]) if pick.get("responsibility") in resp_opts else 0)
+        roles = ["staff", "manager", "owner"]
+        role = b.selectbox("Access level", roles, index=roles.index(pick["role"]), disabled=not owner,
+                           format_func=lambda r: ROLE_LABEL[r])
+        active = st.checkbox("Account is active (untick to switch this person off)", value=pick["active"])
+        save = st.form_submit_button("Save changes", type="primary")
+    if save:
+        try:
+            upd = {"full_name": name.strip(), "phone": phone.strip() or None, "responsibility": resp, "active": active}
+            if owner:
+                upd["role"] = role
+            gone = db().table("profiles").update(upd).eq("id", pick["id"]).execute().data
+            if gone:
+                done(f"{name.strip()} updated")
+            else:
+                st.error("You do not have permission to change this person.")
+        except Exception as e:
+            err(e)
+    password_box("staffpage")
+
+
+def task_card_html(o, pct, color, lock):
+    due = f"Due {o['due_date']}" if o.get("due_date") else "No due date"
+    look_ = " · ".join(x for x in [o.get("fabric"), o.get("style")] if x) or "—"
+    return (f'<div class="oc"><div class="id">{html.escape(o["order_no"])}</div>'
+            f'<div class="row"><span>👤 {html.escape(o["customer"])}</span></div>'
+            f'<div class="row sub"><span>🧵 {html.escape(o.get("garment_type") or "—")}</span></div>'
+            f'<div class="row sub"><span>{html.escape(look_)}</span></div>'
+            f'<div class="row sub"><span>📅 {due}</span><span>{lock}</span></div>'
+            f'<div class="bar"><span style="width:{pct}%;background:{color}"></span></div></div>')
+
+
+def staff_move(order_id, stage):
+    try:
+        db().rpc("staff_set_stage", {"p_order": order_id, "p_stage": stage}).execute()
+        st.rerun()
+    except Exception as e:
+        err(e)
+
+
+def my_tasks():
+    stages = rows("stages", order="position", desc=False)
+    keys = [s["key"] for s in stages]
+    pos = {s["key"]: s["position"] for s in stages}
+    orders = [o for o in rows("my_orders") if o["stage"] != keys[-1]]
+    if not orders:
+        st.info("No orders are assigned to you right now.")
+        return
+    meas = rows("my_measurements")
+    live = [s for s in stages if any(o["stage"] == s["key"] for o in orders)]
+    for r in range(0, len(live), 4):
+        chunk = live[r:r + 4]
+        cols = st.columns(4)
+        for col, s in zip(cols, chunk):
+            here = [o for o in orders if o["stage"] == s["key"]]
+            color = COLORS[(s["position"] - 1) % len(COLORS)]
+            with col:
+                st.markdown(f'<div class="coltitle"><span style="color:{color}">●</span> {s["label"]} '
+                            f'<span style="opacity:.6">({len(here)})</span></div>', unsafe_allow_html=True)
+                for o in here:
+                    pct = round(100 * pos[o["stage"]] / len(stages))
+                    lock = "🔒 Design locked" if pos[o["stage"]] >= pos["cutting"] else ""
+                    with st.container(border=True):
+                        st.markdown(task_card_html(o, pct, color, lock), unsafe_allow_html=True)
+                        i = keys.index(s["key"])
+                        l, rr = st.columns(2)
+                        if i > 0 and l.button("‹ Back", key=f"tb{o['id']}"):
+                            staff_move(o["id"], keys[i - 1])
+                        if i < len(keys) - 1 and rr.button("Next ›", key=f"tn{o['id']}"):
+                            staff_move(o["id"], keys[i + 1])
+                        with st.expander("Details and measurements"):
+                            if o.get("modifications"):
+                                st.write(f"**Modifications:** {o['modifications']}")
+                            if o.get("special_requirements"):
+                                st.write(f"**Special requirements:** {o['special_requirements']}")
+                            sets = [m for m in meas if m["customer_id"] == o["customer_id"]]
+                            for m in sets:
+                                st.caption(f"{m.get('attire') or 'Measurements'} · {m['unit']}")
+                                vals = m.get("measurement_values") or {}
+                                if vals:
+                                    st.dataframe(pd.DataFrame(list(vals.items()), columns=["Measurement", m["unit"]]),
+                                                 width="stretch", hide_index=True)
+                            if not sets:
+                                st.caption("No measurements recorded yet.")
+                            with st.form(f"wu_{o['id']}", clear_on_submit=True):
+                                kind = st.selectbox("Work update", ["started", "progress", "completed", "delayed"],
+                                                    key=f"wuk_{o['id']}")
+                                note = st.text_input("Note", key=f"wun_{o['id']}")
+                                if st.form_submit_button("Save update"):
+                                    try:
+                                        rec = {"order_id": o["id"], "kind": kind}
+                                        if note.strip():
+                                            rec["note"] = note.strip()
+                                        db().table("work_updates").insert(rec).execute()
+                                        done("Update saved")
+                                    except Exception as e:
+                                        err(e)
+
+
+CUSTOM = {"staff_page": staff_page, "my_account": my_account, "customer_details": customer_details, "stock_in": stock_in, "stock_out": stock_out, "fashion_design_changes": design_changes}
 
 
 # ---------------------------------------------------------------- dashboard & board
@@ -834,6 +1049,11 @@ def dashboard():
 
 def sidebar_summary():
     try:
+        if is_staff_role():
+            n = sum(1 for o in rows("my_orders", "id,stage") if o["stage"] != "delivered")
+            st.markdown(f'<div class="sum"><b>Your work</b><br>✅ {n} orders assigned to you</div>',
+                        unsafe_allow_html=True)
+            return
         sym = currency()
         active = sum(1 for o in rows("orders", "stage") if o["stage"] != "delivered")
         delayed = sum(1 for a in rows("alerts_orders") if a["alert"] == "delayed")
@@ -876,18 +1096,23 @@ def login():
                 st.exception(e)
 
 
-ICON = {"Dashboard": "▦", "Orders": "🛍", "Customers": "👥", "Fashion": "🧵", "Stock": "📦",
+ICON = {"My tasks": "✅", "My account": "👤", "Dashboard": "▦", "Orders": "🛍", "Customers": "👥", "Fashion": "🧵", "Stock": "📦",
         "Ready-to-wear": "👗", "Money": "💳", "Team": "🧑‍🤝‍🧑"}
 
 
 def main():
     st.markdown(STYLE, unsafe_allow_html=True)
     uid = db().auth.get_user().user.id
-    me = db().table("profiles").select("full_name,role").eq("id", uid).execute().data
+    me = db().table("profiles").select("full_name,role,responsibility").eq("id", uid).execute().data
+    if me:
+        st.session_state["me"] = me[0]
+    nav = NAV_STAFF if (me and me[0]["role"] == "staff") else NAV
     with st.sidebar:
         st.markdown(f'<div class="brand">{html.escape(BIZ)}</div>', unsafe_allow_html=True)
-        section = st.session_state.get("section", "Dashboard")
-        for name in NAV:
+        section = st.session_state.get("section")
+        if section not in nav:
+            section = next(iter(nav))
+        for name in nav:
             if st.button(f"{ICON.get(name, '•')}  {name}", key=f"nav_{name}", width="stretch",
                          type="primary" if name == section else "secondary"):
                 st.session_state["section"] = name
@@ -907,8 +1132,10 @@ def main():
         st.success(flash)
     if section == "Dashboard":
         dashboard()
+    elif section == "My tasks":
+        my_tasks()
     else:
-        tabs = NAV[section]
+        tabs = nav[section]
         pick = st.radio("View", tabs, format_func=lambda t: CFG[t]["title"], horizontal=True,
                         label_visibility="collapsed") if len(tabs) > 1 else tabs[0]
         CUSTOM[pick]() if pick in CUSTOM else table_view(pick)
