@@ -1,19 +1,21 @@
 """Nexxora Business Brain: Fashion branch (staff app + customer tracking page).
 Streamlit + Supabase. Works on phone and desktop (columns stack on narrow screens)."""
+import base64
 import hashlib
 import html
 import re
 import unicodedata
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 from supabase import create_client
 
-st.set_page_config(page_title="Nexxora Fashion", page_icon="🧵", layout="wide")
+st.set_page_config(page_title="Thanos of Lagos", page_icon="🧵", layout="wide")
 
 URL, KEY = st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_ANON_KEY"]
-BIZ = st.secrets.get("BUSINESS_NAME", "B3")
+BIZ = st.secrets.get("BUSINESS_NAME", "Thanos of Lagos")
 APP_URL = st.secrets.get("APP_URL", "").rstrip("/")
 
 
@@ -1407,7 +1409,7 @@ STYLE = """
 [data-testid="stSidebar"] button[kind="primary"],[data-testid="stSidebar"] [data-testid="stBaseButton-primary"]{
   background:rgba(255,255,255,.16) !important;font-weight:600}
 [data-testid="stSidebar"] .brand{background:#243a52;border:1px solid #3a5876;border-radius:12px;padding:10px 14px;
-  margin-bottom:10px;font-size:20px;font-weight:700;letter-spacing:.05em;color:#ffffff}
+  margin-bottom:10px;font-size:17px;line-height:1.25;font-weight:700;letter-spacing:.04em;color:#ffffff}
 [data-testid="stSidebar"] .sum{background:#243a52;border:1px solid #3a5876;border-radius:12px;padding:12px 14px;
   margin-top:14px;font-size:14px;line-height:1.7;color:#f1f5f9;word-break:break-word}
 [data-testid="stSidebar"] .who{margin:10px 2px 6px;font-size:13px;color:#b9c6d6}
@@ -1573,26 +1575,111 @@ def move(order_id, stage):
 
 
 # ---------------------------------------------------------------- app shell
+@st.cache_resource
+def hero_image_url():
+    """The three-panel photo, read once from login_hero.jpg next to this file (blank if it is missing)."""
+    p = Path(__file__).parent / "login_hero.jpg"
+    return ("data:image/jpeg;base64," + base64.b64encode(p.read_bytes()).decode()) if p.exists() else ""
+
+
+LOGIN_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;0,700;1,500&family=Inter:wght@400;500;600&display=swap');
+[data-testid="stHeader"],[data-testid="stToolbar"],[data-testid="stDecoration"],[data-testid="stStatusWidget"],#MainMenu,footer{display:none !important}
+.stApp{background:#faf7f2}
+html,body,.stApp,.stApp *{font-family:'Inter',system-ui,sans-serif}
+[data-testid="stMainBlockContainer"],.block-container{padding:0 !important;max-width:none !important}
+.th-hero{position:fixed;left:0;top:0;bottom:0;width:56vw;overflow:hidden;background:#14202e;z-index:0}
+.th-hero::before{content:"";position:absolute;inset:0;background:url(__IMG__) center top/cover no-repeat;
+  animation:thzoom 28s ease-in-out infinite alternate}
+.th-hero::after{content:"";position:absolute;inset:0;background:linear-gradient(to top,rgba(8,14,24,.82) 0%,rgba(8,14,24,0) 42%)}
+.th-cap{position:absolute;left:48px;right:48px;bottom:46px;z-index:2;color:#fff}
+.th-cap span{font-size:.7rem;letter-spacing:.34em;text-transform:uppercase;opacity:.85}
+.th-cap p{font-family:'Cormorant Garamond',Georgia,serif !important;font-style:italic;font-weight:500;
+  font-size:2.2rem;line-height:1.15;margin:.55rem 0 0}
+@keyframes thzoom{from{transform:scale(1)}to{transform:scale(1.07)}}
+@keyframes thfade{from{opacity:0}to{opacity:1}}
+@media (prefers-reduced-motion:reduce){.th-hero::before{animation:none}}
+[data-testid="stMainBlockContainer"]>[data-testid="stVerticalBlock"]{margin-left:56vw;width:44vw;min-height:100vh;
+  box-sizing:border-box;padding:0 clamp(28px,5vw,84px);justify-content:center;align-items:center;gap:1rem;
+  animation:thfade .9s ease both}
+[data-testid="stMainBlockContainer"]>[data-testid="stVerticalBlock"]>div{width:100%;max-width:420px}
+.th-mark{display:flex;gap:4px;margin-bottom:1.5rem}
+.th-mark i{display:block;width:30px;height:4px}
+.th-mark i:nth-child(1){background:#c4571a}.th-mark i:nth-child(2){background:#e6d3ac}.th-mark i:nth-child(3){background:#1f3a6b}
+.th-title{font-family:'Cormorant Garamond',Georgia,serif !important;font-size:3.1rem;line-height:1;font-weight:600;
+  color:#14202e;letter-spacing:.01em}
+.th-hello{margin-top:1.1rem;font-size:.7rem;letter-spacing:.3em;text-transform:uppercase;color:#a0937f}
+.th-sub{margin-top:.35rem;color:#5d564c;font-size:.95rem}
+[data-testid="stForm"]{border:none !important;padding:0 !important;background:transparent}
+[data-testid="stTextInput"] label p{font-size:.7rem;letter-spacing:.16em;text-transform:uppercase;color:#8a7f70;font-weight:500}
+[data-testid="stTextInput"] div[data-baseweb="input"],[data-testid="stTextInput"] div[data-baseweb="base-input"]{
+  background:transparent !important;border:none !important;border-radius:0 !important}
+[data-testid="stTextInput"] div[data-baseweb="input"]{border-bottom:1px solid #cfc6b8 !important}
+[data-testid="stTextInput"] div[data-baseweb="input"]:focus-within{border-bottom:1px solid #14202e !important}
+[data-testid="stTextInput"] input{background:transparent !important;padding-left:0 !important;font-size:1rem;color:#14202e}
+[data-testid="stFormSubmitButton"] button{width:100%;height:3.1rem;border-radius:0 !important;border:none !important;
+  background:#14202e !important;color:#fff !important;letter-spacing:.18em;text-transform:uppercase;font-size:.78rem;font-weight:600}
+[data-testid="stFormSubmitButton"] button:hover{background:#243a52 !important}
+[data-testid="stAlert"]{border-radius:0;border:none;border-left:3px solid #b3261e;background:#fbeeee}
+[data-testid="stAlert"] *{color:#8a1f1f !important}
+.th-foot{margin-top:.6rem;color:#9a8f7d;font-size:.78rem;line-height:1.7}
+.th-foot span{letter-spacing:.2em;text-transform:uppercase;font-size:.62rem;color:#b9ae9b}
+@media (max-width:900px){
+  .th-hero{position:relative;left:50%;width:100vw;margin-left:-50vw;height:30vh}
+  .th-cap{display:none}
+  [data-testid="stMainBlockContainer"]>[data-testid="stVerticalBlock"]{margin-left:0;width:100%;min-height:auto;
+    padding:0 24px 40px;justify-content:flex-start}
+  .th-title{font-size:2.5rem}
+}
+</style>
+"""
+
+
+def login_error(e):
+    """Plain-language message only: never codes or technical details."""
+    m = (getattr(e, "message", None) or str(e)).lower()
+    if "invalid login" in m or "invalid credentials" in m or "invalid_credentials" in m:
+        return "Email or password incorrect. Please check and try again."
+    if "not confirmed" in m:
+        return "This account isn't active yet. Please contact the owner."
+    if "rate limit" in m or "too many" in m:
+        return "Too many attempts. Please wait a minute and try again."
+    if "api key" in m or "apikey" in m or "jwt" in m:
+        return "The app isn't set up correctly. Please contact support."
+    if any(x in m for x in ("name or service", "connect", "timed out", "timeout", "network", "getaddrinfo")):
+        return "We couldn't reach the server. Please check your internet connection and try again."
+    return "Sign-in failed. Please try again."
+
+
 def login():
-    _, mid, _ = st.columns([1, 2, 1])
-    with mid:
-        st.title(f"{BIZ} 🧵")
-        if not URL.startswith("https://") or "YOUR-" in URL or "YOUR-" in KEY:
-            st.error("The app's Secrets are not set correctly. Open Manage app > Settings > Secrets "
-                     "and paste the real SUPABASE_URL (starts with https://) and SUPABASE_ANON_KEY.")
-        with st.form("login"):
-            email = st.text_input("Email")
-            pw = st.text_input("Password", type="password")
-            go = st.form_submit_button("Sign in", type="primary")
-        if go:
+    st.markdown(LOGIN_CSS.replace("__IMG__", hero_image_url() or "none"), unsafe_allow_html=True)
+    hour = datetime.now(timezone(timedelta(hours=1))).hour   # Lagos time
+    hello = "Good morning" if hour < 12 else "Good afternoon" if hour < 17 else "Good evening"
+    st.markdown('<div class="th-hero"><div class="th-cap"><span>Bespoke &nbsp;·&nbsp; Ready-to-wear</span>'
+                '<p>Made to measure.<br>Made in Lagos.</p></div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="th-brand"><div class="th-mark"><i></i><i></i><i></i></div>'
+                f'<div class="th-title">{html.escape(BIZ)}</div><div class="th-hello">{hello}</div>'
+                f'<div class="th-sub">Sign in to continue to your atelier dashboard.</div></div>', unsafe_allow_html=True)
+    with st.form("login"):
+        email = st.text_input("Email", placeholder="you@example.com")
+        pw = st.text_input("Password", type="password", placeholder="••••••••")
+        go = st.form_submit_button("Sign in")
+    if go:
+        if not email.strip() or not pw:
+            st.error("Please enter your email and password.")
+        elif not URL.startswith("https://") or "YOUR-" in URL or "YOUR-" in KEY:
+            st.error("The app isn't set up correctly. Please contact support.")
+        else:
             try:
                 cl = create_client(URL.strip(), KEY.strip())
                 cl.auth.sign_in_with_password({"email": email.strip(), "password": pw})
                 st.session_state["sb"] = cl
                 st.rerun()
             except Exception as e:
-                st.error("Sign-in failed. The details are below.")
-                st.exception(e)
+                st.error(login_error(e))
+    st.markdown('<div class="th-foot">Staff access only. Need an account? Ask the owner.<br>'
+                '<span>Powered by Nexxora</span></div>', unsafe_allow_html=True)
 
 
 ICON = {"My tasks": "✅", "My account": "👤", "Dashboard": "▦", "Orders": "🛍", "Customers": "👥", "Fashion": "🧵", "Stock": "📦",
