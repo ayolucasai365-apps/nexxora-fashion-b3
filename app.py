@@ -268,11 +268,18 @@ def add_form(name):
                 det = {f[0]: clean(f, vals[f[0]]) for f in c.get("d", [])}
                 det = {k: v for k, v in det.items() if v is not None}
                 try:
+                    msg, before = "Saved", None
+                    if name == "payments" and rec.get("order_id"):
+                        before = db().table("orders").select("order_no,stage").eq("id", rec["order_id"]).execute().data
                     t = db().table(name)
                     res = (t.upsert(rec) if c.get("up") else t.insert(rec)).execute()
+                    if before:
+                        after = db().table("orders").select("order_no,stage").eq("id", rec["order_id"]).execute().data
+                        if before[0]["stage"] == "order_received" and after and after[0]["stage"] == "payment_confirmed":
+                            msg = f"Payment saved. {after[0]['order_no']} moved to Payment Confirmed automatically."
                     if det:  # order details (garment, fabric, style...) go to the design details record
                         db().table("fashion_order_details").upsert({"order_id": res.data[0]["id"], **det}).execute()
-                    done("Saved")
+                    done(msg)
                 except Exception as e:  # database rules show here, e.g. a refused change
                     err(e)
 
@@ -314,6 +321,9 @@ def table_view(name):
         order_form()
     elif not CFG[name].get("ro"):
         add_form(name)
+    if name == "payments":
+        st.caption("Recording a payment on an order that is at Order Received moves it to Payment Confirmed "
+                   "automatically. Nothing else moves by itself.")
     if name == "stock_levels":
         st.caption("**Low-stock alert at** is the level that warns you: when the yards on hand fall to this "
                    "number or below, the item shows LOW and appears on the dashboard. "
@@ -493,8 +503,8 @@ def order_form():
                                    format_func=lambda k: "—" if k is None else offerings[k])
             due = a.date_input("Due date", value=None)
             total = b.number_input("Total price", value=None, min_value=0.0)
-            stage = a.selectbox("Stage", keys, index=keys.index("order_received") if "order_received" in keys else 0,
-                                format_func=lambda k: stages[k])
+            stage = "order_received"  # every order starts here; recording a payment moves it on
+            a.caption("New orders start at **Order Received** and move on automatically once a payment is recorded.")
             instr = st.text_area("Original instructions (paste WhatsApp text)")
             st.markdown("**Design details**")
             c, d = st.columns(2)
@@ -866,10 +876,12 @@ def my_tasks():
                     with st.container(border=True):
                         st.markdown(task_card_html(o, pct, color, lock), unsafe_allow_html=True)
                         i = keys.index(s["key"])
+                        if s["key"] == "order_received":
+                            st.caption("⏳ Awaiting payment")
                         l, rr = st.columns(2)
-                        if i > 0 and l.button("‹ Back", key=f"tb{o['id']}"):
+                        if i > 0 and s["key"] != "payment_confirmed" and l.button("‹ Back", key=f"tb{o['id']}"):
                             staff_move(o["id"], keys[i - 1])
-                        if i < len(keys) - 1 and rr.button("Next ›", key=f"tn{o['id']}"):
+                        if i < len(keys) - 1 and s["key"] != "order_received" and rr.button("Next ›", key=f"tn{o['id']}"):
                             staff_move(o["id"], keys[i + 1])
                         with st.expander("Details and measurements"):
                             if o.get("modifications"):
@@ -1017,14 +1029,16 @@ def dashboard():
                     with st.container(border=True):
                         st.markdown(card_html(o, det, bal.get(o["id"], {}), pct, color, sym), unsafe_allow_html=True)
                         i = keys.index(s["key"])
+                        if s["key"] == "order_received":
+                            st.caption("⏳ Awaiting payment. It moves on by itself once a payment is recorded under Money.")
                         l, m, rr = st.columns(3)
-                        if i > 0 and l.button("‹", key=f"p{o['id']}", help="Move back a stage"):
+                        if i > 0 and s["key"] != "payment_confirmed" and l.button("‹", key=f"p{o['id']}", help="Move back a stage"):
                             move(o["id"], keys[i - 1])
                         with m.popover("⋮"):
                             st.caption("🔒 Design locked" if win == "locked" else f"Design {win}")
                             st.caption("Customer tracking link")
                             st.code(f"{APP_URL}/?t={o['tracking_token']}")
-                        if i < len(keys) - 1 and rr.button("›", key=f"n{o['id']}", help="Move to next stage"):
+                        if i < len(keys) - 1 and s["key"] != "order_received" and rr.button("›", key=f"n{o['id']}", help="Move to next stage"):
                             move(o["id"], keys[i + 1])
     if not shown:
         st.info("No orders match. Add one with ➕ New order.")
