@@ -251,10 +251,22 @@ def clean(f, v):
     return v
 
 
+def order_labels_with_balance():
+    sym = currency()
+    bal = {b["order_id"]: b for b in rows("order_balances")}
+    out = {}
+    for o in rows("orders", "id,order_no,customers(full_name)", order="created_at"):
+        owing = float(bal.get(o["id"], {}).get("outstanding") or 0)
+        out[o["id"]] = f"{o['order_no']} — {o['customers']['full_name']} — balance {sym}{owing:,.0f}"
+    return out
+
+
 def add_form(name):
     c = CFG[name]
     fields = c["f"] + c.get("d", [])
     maps = {f[0]: look(*f[3].split(":")) for f in fields if f[2] == "s" and isinstance(f[3], str)}
+    if name == "payments":
+        maps["order_id"] = order_labels_with_balance()
     with st.expander(f"➕ Add — {c['title']}"):
         with st.form(f"add_{name}", clear_on_submit=True):
             grid = st.columns(2)
@@ -624,13 +636,22 @@ def customer_details():
                     err(e)
 
     st.markdown("### Orders")
+    sym = currency()
     stage_names = look("stages", "key", "label")
-    orders = (db().table("orders").select("order_no,stage,due_date,total_amount").eq("customer_id", pick["id"])
+    orders = (db().table("orders").select("id,order_no,stage,due_date,total_amount").eq("customer_id", pick["id"])
               .order("created_at", desc=True).execute().data)
     if orders:
+        paid_by = {b["order_id"]: float(b["paid"] or 0) for b in
+                   db().table("order_balances").select("order_id,paid")
+                   .in_("order_id", [o["id"] for o in orders]).execute().data}
         df = pd.DataFrame(orders)
+        df["paid"] = df["id"].map(paid_by).fillna(0)
+        df["balance"] = (df["total_amount"].astype(float) - df["paid"]).clip(lower=0)
+        st.caption(f"Billed {sym}{df['total_amount'].astype(float).sum():,.0f} · Paid {sym}{df['paid'].sum():,.0f} "
+                   f"· Outstanding {sym}{df['balance'].sum():,.0f}")
         df["stage"] = df["stage"].map(stage_names)
-        st.dataframe(df.rename(columns=lab), width="stretch", hide_index=True)
+        st.dataframe(df[["order_no", "stage", "due_date", "total_amount", "paid", "balance"]].rename(columns=lab),
+                     width="stretch", hide_index=True)
     else:
         st.caption("No orders yet for this customer.")
 
@@ -961,10 +982,13 @@ def card_html(o, det, bal, pct, color, sym):
     badge = BADGE.get(bal.get("payment_status", "unpaid"), BADGE["unpaid"])
     due = f"Due {o['due_date']}" if o.get("due_date") else "No due date"
     garment = html.escape(det.get("garment_type") or "—")
+    paid = float(bal.get("paid") or 0)
+    owing = max(float(o["total_amount"] or 0) - paid, 0)
     return (f'<div class="oc"><div class="id">{html.escape(o["order_no"])}</div>'
             f'<div class="row"><span>👤 {html.escape(o["customers"]["full_name"])}</span>'
             f'<span class="price">{sym}{float(o["total_amount"] or 0):,.0f}</span></div>'
             f'<div class="row sub"><span>📅 {due}</span></div>'
+            f'<div class="row sub"><span>💵 Paid {sym}{paid:,.0f} · Balance {sym}{owing:,.0f}</span></div>'
             f'<div class="row sub"><span>🧵 {garment}</span>'
             f'<span class="bdg {badge[1]}">{badge[0]}</span></div>'
             f'<div class="bar"><span style="width:{pct}%;background:{color}"></span></div></div>')
