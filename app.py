@@ -1,6 +1,8 @@
 """Nexxora Business Brain: Fashion branch (staff app + customer tracking page).
 Streamlit + Supabase. Works on phone and desktop (columns stack on narrow screens)."""
+import hashlib
 import html
+import re
 import unicodedata
 from datetime import date, datetime, timedelta
 
@@ -166,29 +168,11 @@ CFG = {
         f=[F("customer_id", "Client", "s", "customers:id:full_name")]),
     "stock_in": dict(title="Stock in"),
     "stock_out": dict(title="Stock out"),
-    "rtw_products": dict(title="RTW products", order="created_at", cols=["style_code", "name", "price"],
-        f=[F("style_code", "Style code"), F("name"), F("price", kind="n"), F("description", kind="x")]),
-    "rtw_variants": dict(title="SKUs / variants", order=None,
-        cols=["sku", "tag_no", "product_id", "size", "colour", "price", "reorder_level"],
-        f=[F("product_id", "Product", "s", "rtw_products:id:name"), F("sku", "SKU"),
-           F("tag_no", "Tag number"), F("size"), F("colour"), F("price", kind="n"),
-           F("reorder_level", "Low-stock level", "n")]),
-    "rtw_levels": dict(title="RTW stock", ro=True, order=None,
-        cols=["sku", "tag_no", "name", "size", "colour", "on_hand", "reorder_level"]),
-    "rtw_movements": dict(title="RTW stock in", order="created_at",
-        cols=["variant_id", "movement_type", "qty", "note", "created_at"],
-        f=[F("variant_id", "SKU", "s", "rtw_variants:id:sku"),
-           F("movement_type", "Type", "s", ["opening", "in", "return", "adjust_up", "adjust_down"]),
-           F("qty", kind="n"), F("note")]),
-    "quick_sales": dict(title="Quick sales", order="sold_at",
-        cols=["sale_no", "sold_at", "total", "payment_method", "customer_id"],
-        f=[F("customer_id", "Customer (optional)", "s", "customers:id:full_name"),
-           F("payment_method", "Payment", "s", ["cash", "transfer", "POS", "other"]), F("note")]),
-    "quick_sale_items": dict(title="Sale lines (add after creating the sale)", order=None,
-        cols=["sale_id", "variant_id", "qty", "unit_price"],
-        f=[F("sale_id", "Sale", "s", "quick_sales:id:sale_no"),
-           F("variant_id", "SKU", "s", "rtw_variants:id:sku"), F("qty", kind="n"),
-           F("unit_price", "Unit price (blank = list price)", "n")]),
+    "rtw_stock": dict(title="Stock levels"),
+    "rtw_catalog_page": dict(title="Products & SKUs"),
+    "rtw_stock_in": dict(title="Stock in"),
+    "new_sale": dict(title="New sale"),
+    "sales_history": dict(title="Sales history"),
     "work_updates": dict(title="Work updates", order="created_at", cols=["order_id", "kind", "note", "created_at"],
         f=[F("order_id", "Order", "s", "orders:id:order_no"),
            F("kind", kind="s", extra=["started", "progress", "completed", "delayed"]), F("note", kind="x")]),
@@ -210,7 +194,7 @@ NAV = {
     "Customers": ["customer_details"],
     "Fashion": ["fashion_order_details", "fashion_design_changes", "fashion_qc", "fashion_fittings"],
     "Stock": ["stock_levels", "stock_in", "stock_out"],
-    "Ready-to-wear": ["rtw_levels", "rtw_products", "rtw_variants", "rtw_movements", "quick_sales", "quick_sale_items"],
+    "Ready-to-wear": ["rtw_stock", "rtw_catalog_page", "rtw_stock_in", "new_sale", "sales_history"],
     "Money": ["payments", "order_balances", "expenses"],
     "Team": ["staff_page", "work_updates", "attendance", "communications", "message_templates"],
 }
@@ -1086,7 +1070,325 @@ def my_tasks():
                                         err(e)
 
 
-CUSTOM = {"staff_page": staff_page, "my_account": my_account, "customer_details": customer_details, "stock_in": stock_in, "stock_out": stock_out, "fashion_design_changes": design_changes}
+# ---------------------------------------------------------------- ready-to-wear
+def code3(p):
+    """3 consonants of a name (mirror of the database's name_code), e.g. Gown -> GWN."""
+    tr = str.maketrans("àáâãäèéêëìíîïòóôõöùúûüẹọṣñç", "aaaaaeeeeiiiiooooouuuuessnc")
+    letters = re.sub("[^a-z]", "", (p or "").lower().translate(tr)).upper()
+    cons = re.sub("[AEIOU]", "", letters)
+    code = cons[:3]
+    if len(code) < 3:
+        code += re.sub("[^AEIOU]", "", letters)[:3 - len(code)]
+    return code.ljust(3, "X")
+
+
+def colour3(p):
+    tr = str.maketrans("àáâãäèéêëìíîïòóôõöùúûüẹọṣñç", "aaaaaeeeeiiiiooooouuuuessnc")
+    return re.sub("[^a-z]", "", (p or "").lower().translate(tr))[:3].upper()
+
+
+def variant_label(v):
+    return f"{v['sku']} — {v['name']} {v.get('colour') or ''} {v.get('size') or ''}".replace("  ", " ").strip()
+
+
+def rtw_stock():
+    data = rows("rtw_catalog")
+    if not data:
+        st.info("No ready-to-wear products yet. Add one under Products & SKUs.")
+        return
+    for r in data:
+        r["status"] = "LOW" if r["on_hand"] <= r["reorder_level"] else "OK"
+    df = pd.DataFrame(data)
+    q = st.text_input("Search", placeholder="SKU, tag number, product, colour or size", key="rtw_search").strip().lower()
+    if q:
+        hay = df[["sku", "tag_no", "name", "colour", "size"]].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
+        df = df[hay.str.contains(q, regex=False)]
+    st.dataframe(df[["sku", "tag_no", "name", "colour", "size", "price", "on_hand", "reorder_level", "status"]]
+                 .rename(columns=lab), width="stretch", hide_index=True)
+    st.caption("**Low-stock alert at** warns you when a SKU's count falls to that number or below.")
+
+
+def variant_grid(prefix, ver):
+    """Colours x sizes -> one row per SKU with an editable opening quantity."""
+    a, b = st.columns(2)
+    colours = a.text_input("Colours (separate with commas, e.g. Red, Blue, Black)", key=f"{prefix}_cols_{ver}")
+    sizes = b.text_input("Sizes (separate with commas, e.g. 10, 12, 14 or S, M, L)", key=f"{prefix}_sizes_{ver}")
+    cl = [c.strip() for c in colours.split(",") if c.strip()]
+    sl = [x.strip() for x in sizes.split(",") if x.strip()]
+    combos = [(c, x) for c in (cl or [None]) for x in (sl or [None])]
+    sig = hashlib.md5(repr((cl, sl)).encode()).hexdigest()[:8]
+    table = pd.DataFrame({"Colour": [c or "—" for c, _ in combos], "Size": [x or "—" for _, x in combos],
+                          "Opening qty": pd.Series([0] * len(combos), dtype="int64")})
+    edited = st.data_editor(table, hide_index=True, disabled=["Colour", "Size"], width="stretch",
+                            column_config={"Opening qty": st.column_config.NumberColumn(min_value=0, step=1)},
+                            key=f"{prefix}_grid_{ver}_{sig}")
+    variants = [{"colour": c, "size": x, "qty": int(q or 0)} for (c, x), q in zip(combos, edited["Opening qty"])]
+    return variants, cl, sl
+
+
+def rtw_catalog_page():
+    ver = st.session_state.get("np_ver", 0)
+    with st.expander("➕ Add a product (SKUs are generated automatically)", expanded=True):
+        a, b = st.columns(2)
+        name = a.text_input("Product name (e.g. Ankara shirt dress)", key=f"np_name_{ver}")
+        price = b.number_input("Price", value=None, min_value=0.0, key=f"np_price_{ver}")
+        desc = st.text_area("Description", key=f"np_desc_{ver}")
+        variants, cl, sl = variant_grid("np", ver)
+        if name.strip():
+            ex = code3(name) + "###" + (f"-{colour3(cl[0])}" if cl else "") + (f"-{sl[0].upper()}" if sl else "")
+            st.caption(f"{len(variants)} SKU(s) will be created, for example **{ex}** "
+                       "(the number is filled in when you save). Each SKU also gets its own tag number.")
+        if st.button("Create product and SKUs", type="primary", key=f"np_btn_{ver}"):
+            if not name.strip():
+                st.error("Enter the product name.")
+            else:
+                try:
+                    res = db().rpc("create_rtw_product", {"p_name": name.strip(), "p_description": desc.strip(),
+                                                          "p_price": price or 0, "p_variants": variants}).execute().data
+                    st.session_state["np_ver"] = ver + 1
+                    skus = [x["sku"] for x in res["skus"]]
+                    done(f"Product {res['style_code']} created with {len(skus)} SKU(s): " + ", ".join(skus[:6])
+                         + ("…" if len(skus) > 6 else ""))
+                except Exception as e:
+                    err(e)
+
+    prods = rows("rtw_products", "id,style_code,name,description,price,active", order="style_code", desc=False)
+    if prods:
+        with st.expander("➕ Add colours or sizes to an existing product"):
+            avers = st.session_state.get("av_ver", 0)
+            prod = st.selectbox("Product", prods, key=f"av_prod_{avers}",
+                                format_func=lambda p: f"{p['style_code']} — {p['name']}")
+            variants2, _, _ = variant_grid("av", avers)
+            if st.button("Add these SKUs", type="primary", key=f"av_btn_{avers}"):
+                try:
+                    res = db().rpc("add_rtw_variants", {"p_product": prod["id"], "p_variants": variants2}).execute().data
+                    st.session_state["av_ver"] = avers + 1
+                    done(f"{len(res)} new SKU(s) added to {prod['style_code']}" +
+                         (": " + ", ".join(x["sku"] for x in res[:6]) if res else " (they already existed)"))
+                except Exception as e:
+                    err(e)
+
+        vars_ = rows("rtw_variants", "id,sku,tag_no,size,colour,price,reorder_level,active,"
+                                     "rtw_products(style_code,name)", order="sku", desc=False)
+        for v in vars_:
+            v["product"] = f"{v['rtw_products']['style_code']} — {v['rtw_products']['name']}"
+        with st.expander("✏️ Edit a SKU or a product"):
+            if vars_:
+                sku = st.selectbox("SKU", vars_, key="ed_sku", format_func=lambda v: f"{variant_label({**v, 'name': v['rtw_products']['name']})}")
+                with st.form(f"ed_sku_{sku['id']}"):
+                    a, b = st.columns(2)
+                    tag = a.text_input("Tag number", value=sku.get("tag_no") or "")
+                    vprice = b.number_input("Price (blank = use the product's price)", min_value=0.0,
+                                            value=float(sku["price"]) if sku.get("price") is not None else None)
+                    alert = a.number_input("Low-stock alert at", min_value=0, step=1, value=int(sku.get("reorder_level") or 0))
+                    active = b.checkbox("Active (untick to hide this SKU)", value=sku["active"])
+                    if st.form_submit_button("Save SKU", type="primary"):
+                        try:
+                            db().table("rtw_variants").update({"tag_no": tag.strip() or None, "price": vprice,
+                                                              "reorder_level": alert, "active": active}).eq("id", sku["id"]).execute()
+                            done(f"{sku['sku']} updated")
+                        except Exception as e:
+                            err(e)
+            p = st.selectbox("Product", prods, key="ed_prod", format_func=lambda p: f"{p['style_code']} — {p['name']}")
+            with st.form(f"ed_prod_{p['id']}"):
+                a, b = st.columns(2)
+                pname = a.text_input("Product name", value=p["name"])
+                pprice = b.number_input("Price", min_value=0.0, value=float(p["price"] or 0))
+                pdesc = st.text_area("Description", value=p.get("description") or "")
+                pactive = st.checkbox("Active (untick to hide this product and all its SKUs)", value=p["active"])
+                if st.form_submit_button("Save product", type="primary"):
+                    try:
+                        db().table("rtw_products").update({"name": pname.strip(), "price": pprice,
+                                                          "description": pdesc.strip() or None,
+                                                          "active": pactive}).eq("id", p["id"]).execute()
+                        done(f"{p['style_code']} updated. Its SKUs keep their numbers.")
+                    except Exception as e:
+                        err(e)
+        if vars_:
+            df = pd.DataFrame(vars_)
+            df["active"] = df["active"].map({True: "Active", False: "Hidden"})
+            st.dataframe(df[["sku", "tag_no", "product", "colour", "size", "price", "reorder_level", "active"]]
+                         .rename(columns=lab), width="stretch", hide_index=True)
+
+
+RTW_MOVES = {"Opening stock": "opening", "New pieces added": "in", "Customer return": "return",
+             "Adjustment (add)": "adjust_up", "Adjustment (remove: damaged / lost)": "adjust_down"}
+
+
+def rtw_stock_in():
+    cat = rows("rtw_catalog")
+    if not cat:
+        st.info("Add a product first.")
+        return
+    with st.expander("➕ Record stock", expanded=True):
+        with st.form("rtw_in", clear_on_submit=True):
+            sku = st.selectbox("SKU", cat, format_func=lambda v: f"{variant_label(v)} · {v['on_hand']} in stock")
+            a, b = st.columns(2)
+            qty = a.number_input("Quantity", min_value=1, step=1, value=1)
+            kind = b.selectbox("Type", list(RTW_MOVES))
+            note = st.text_input("Note")
+            go = st.form_submit_button("Save", type="primary")
+        if go:
+            rec = {"variant_id": sku["variant_id"], "movement_type": RTW_MOVES[kind], "qty": int(qty)}
+            if note.strip():
+                rec["note"] = note.strip()
+            try:
+                db().table("rtw_movements").insert(rec).execute()
+                done("Stock saved")
+            except Exception as e:
+                err(e)
+    names = {v["variant_id"]: v["sku"] for v in cat}
+    data = db().table("rtw_movements").select("*").neq("movement_type", "sale").order("created_at", desc=True).limit(200).execute().data
+    if data:
+        df = pd.DataFrame(data)
+        df["sku"] = df["variant_id"].map(names)
+        df["date"] = pd.to_datetime(df["created_at"]).dt.strftime("%d %b %Y")
+        st.dataframe(df[["sku", "movement_type", "qty", "note", "date"]].rename(columns=lab), width="stretch", hide_index=True)
+
+
+def sale_receipt_pdf(r):
+    from fpdf import FPDF
+    pdf = FPDF(format="A5")
+    pdf.set_auto_page_break(False)
+    pdf.add_page()
+    w = pdf.w - 2 * pdf.l_margin
+    code = currency_code()
+    pdf.set_font("Helvetica", "B", 22)
+    pdf.cell(w, 12, ascii_safe(BIZ), align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(110, 110, 110)
+    pdf.cell(w, 6, "SALES RECEIPT", align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(3)
+    pdf.set_draw_color(180, 180, 180)
+    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + w, pdf.get_y())
+    pdf.ln(4)
+
+    def pair(label, value, bold=False):
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(110, 110, 110)
+        pdf.cell(w * 0.42, 7, ascii_safe(label))
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("Helvetica", "B" if bold else "", 11)
+        pdf.cell(w * 0.58, 7, ascii_safe(value), align="R", new_x="LMARGIN", new_y="NEXT")
+
+    when = datetime.fromisoformat(str(r["sold_at"]).replace("Z", "+00:00")).strftime("%d %b %Y")
+    pair("Receipt number", r["sale_no"], bold=True)
+    pair("Date", when)
+    pair("Sold to", r.get("buyer") or "Walk-in customer")
+    pdf.ln(3)
+    widths = [w * 0.46, w * 0.10, w * 0.22, w * 0.22]
+    pdf.set_fill_color(240, 240, 240)
+    pdf.set_font("Helvetica", "B", 9)
+    for head, wd, al in zip(["Item", "Qty", "Price", "Total"], widths, ["L", "C", "R", "R"]):
+        pdf.cell(wd, 7, head, fill=True, align=al)
+    pdf.ln(7)
+    pdf.set_font("Helvetica", "", 9)
+    for it in r["items"]:
+        desc = ascii_safe(f"{it['name']} {it.get('colour') or ''} {it.get('size') or ''}".strip())[:28]
+        unit = float(it["unit_price"] or 0)
+        pdf.cell(widths[0], 7, desc)
+        pdf.cell(widths[1], 7, str(it["qty"]), align="C")
+        pdf.cell(widths[2], 7, f"{unit:,.0f}", align="R")
+        pdf.cell(widths[3], 7, f"{unit * int(it['qty']):,.0f}", align="R")
+        pdf.ln(7)
+    pdf.ln(2)
+    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + w, pdf.get_y())
+    pdf.ln(3)
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(w * 0.5, 10, "Total")
+    pdf.cell(w * 0.5, 10, ascii_safe(f"{code} {float(r['total'] or 0):,.2f}"), align="R", new_x="LMARGIN", new_y="NEXT")
+    pair("Payment method", (r.get("method") or "-").capitalize())
+    pdf.set_y(pdf.h - 28)
+    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + w, pdf.get_y())
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "I", 9)
+    pdf.set_text_color(110, 110, 110)
+    pdf.cell(w, 5, "Thank you for your patronage.", align="C")
+    return bytes(pdf.output())
+
+
+def new_sale():
+    sym = currency()
+    last = st.session_state.get("last_sale")
+    if last:
+        st.success(f"✅ Sale {last['sale_no']} recorded: {sym}{float(last['total'] or 0):,.0f}")
+        st.download_button("⬇ Download receipt (PDF)", data=sale_receipt_pdf(last), file_name=f"{last['sale_no']}.pdf",
+                           mime="application/pdf", type="primary", key="dl_last_sale")
+        if st.button("Start a new sale"):
+            st.session_state.pop("last_sale")
+            st.rerun()
+        return
+    cat = [v for v in rows("rtw_catalog") if v["on_hand"] > 0]
+    if not cat:
+        st.info("Nothing in stock to sell yet.")
+        return
+    cart = st.session_state.setdefault("cart", [])
+    st.markdown("#### Add items")
+    a, b, c = st.columns([4, 1, 1])
+    item = a.selectbox("Item", cat, key="sale_item",
+                       format_func=lambda v: f"{variant_label(v)} · {v['on_hand']} in stock")
+    qty = b.number_input("Qty", min_value=1, step=1, value=1, key="sale_qty")
+    price = c.number_input("Price", min_value=0.0, value=float(item["price"] or 0), key=f"sale_price_{item['variant_id']}")
+    if st.button("➕ Add to sale"):
+        cart.append({"variant_id": item["variant_id"], "label": variant_label(item), "qty": int(qty), "price": float(price)})
+        st.rerun()
+    if cart:
+        st.markdown("#### This sale")
+        for i, line in enumerate(cart):
+            x, y = st.columns([8, 1])
+            x.write(f"{line['label']} × {line['qty']} — {sym}{line['price'] * line['qty']:,.0f}")
+            if y.button("✖", key=f"rm_{i}", help="Remove this line"):
+                cart.pop(i)
+                st.rerun()
+        total = sum(l["price"] * l["qty"] for l in cart)
+        st.markdown(f"**Total: {sym}{total:,.0f}**")
+        customers = look("customers", "id", "full_name")
+        p, q, r = st.columns(3)
+        cust = p.selectbox("Customer (optional)", [None] + list(customers), key="sale_cust",
+                           format_func=lambda k: "Walk-in customer" if k is None else customers[k]) if customers else None
+        buyer = q.text_input("Buyer's name (optional)", key="sale_buyer")
+        method = r.selectbox("Payment method", ["cash", "transfer", "POS", "other"], key="sale_method")
+        if st.button("✅ Complete sale", type="primary"):
+            try:
+                items = [{"variant_id": l["variant_id"], "qty": l["qty"], "unit_price": l["price"]} for l in cart]
+                res = db().rpc("record_quick_sale", {"p_customer": cust, "p_buyer": buyer.strip(), "p_method": method,
+                                                     "p_items": items}).execute().data
+                st.session_state["last_sale"] = res
+                st.session_state["cart"] = []
+                st.rerun()
+            except Exception as e:
+                err(e)
+    else:
+        st.caption("Pick an item, set the quantity and price, then add it to the sale.")
+
+
+def sales_history():
+    sym = currency()
+    sales = rows("quick_sales", "id,sale_no,sold_at,total,payment_method,buyer_name,customers(full_name)", order="sold_at")
+    if not sales:
+        st.info("No sales yet.")
+        return
+    for s_ in sales:
+        s_["buyer"] = (s_.get("customers") or {}).get("full_name") or s_.get("buyer_name") or "Walk-in customer"
+    df = pd.DataFrame(sales)
+    df["sold_at"] = pd.to_datetime(df["sold_at"]).dt.strftime("%d %b %Y")
+    st.dataframe(df[["sale_no", "sold_at", "buyer", "total", "payment_method"]].rename(columns=lab),
+                 width="stretch", hide_index=True)
+    pick = st.selectbox("Sale", sales, key="hist_sale", format_func=lambda s_: f"{s_['sale_no']} — {s_['buyer']} — "
+                                                                              f"{sym}{float(s_['total'] or 0):,.0f}")
+    lines = (db().table("quick_sale_items").select("qty,unit_price,rtw_variants(sku,size,colour,rtw_products(name))")
+             .eq("sale_id", pick["id"]).execute().data)
+    items = [{"sku": l["rtw_variants"]["sku"], "name": l["rtw_variants"]["rtw_products"]["name"],
+              "colour": l["rtw_variants"]["colour"], "size": l["rtw_variants"]["size"],
+              "qty": l["qty"], "unit_price": l["unit_price"]} for l in lines]
+    sale = {"sale_no": pick["sale_no"], "sold_at": pick["sold_at"], "total": pick["total"], "buyer": pick["buyer"],
+            "method": pick["payment_method"], "items": items}
+    st.download_button("⬇ Download receipt (PDF)", data=sale_receipt_pdf(sale), file_name=f"{pick['sale_no']}.pdf",
+                       mime="application/pdf", type="primary", key=f"dl_{pick['id']}")
+
+
+CUSTOM = {"rtw_stock": rtw_stock, "rtw_catalog_page": rtw_catalog_page, "rtw_stock_in": rtw_stock_in, "new_sale": new_sale, "sales_history": sales_history, "staff_page": staff_page, "my_account": my_account, "customer_details": customer_details, "stock_in": stock_in, "stock_out": stock_out, "fashion_design_changes": design_changes}
 
 
 # ---------------------------------------------------------------- dashboard & board
@@ -1254,6 +1556,8 @@ def sidebar_summary():
         delayed = sum(1 for a in rows("alerts_orders") if a["alert"] == "delayed")
         paid = sum(float(p["amount"]) for p in db().table("payments").select("amount")
                    .gte("paid_at", date.today().isoformat()).execute().data)
+        paid += sum(float(q["total"]) for q in db().table("quick_sales").select("total")
+                    .gte("sold_at", date.today().isoformat()).execute().data)
         st.markdown(f'<div class="sum"><b>Today\'s Summary</b><br>📋 {active} active orders<br>'
                     f'⚠ {delayed} delayed<br>💵 {sym}{paid:,.0f} received today</div>', unsafe_allow_html=True)
     except Exception:
@@ -1302,6 +1606,9 @@ def main():
     if me:
         st.session_state["me"] = me[0]
     nav = NAV_STAFF if (me and me[0]["role"] == "staff") else NAV
+    if me and me[0]["role"] == "staff" and me[0].get("responsibility") == "Sales / front desk":
+        nav = {"My tasks": None, "Ready-to-wear": ["rtw_stock", "new_sale"],
+               **{k: v for k, v in NAV_STAFF.items() if k != "My tasks"}}
     with st.sidebar:
         st.markdown(f'<div class="brand">{html.escape(BIZ)}</div>', unsafe_allow_html=True)
         section = st.session_state.get("section")
