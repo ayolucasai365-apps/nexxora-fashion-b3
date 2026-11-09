@@ -1,6 +1,7 @@
 """Nexxora Business Brain: Fashion branch (staff app + customer tracking page).
 Streamlit + Supabase. Works on phone and desktop (columns stack on narrow screens)."""
 import html
+import unicodedata
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -88,7 +89,14 @@ def F(col, label=None, kind="t", extra=None, default=None):
 
 
 def err(e):
-    st.error(getattr(e, "message", None) or str(e))
+    msg = getattr(e, "message", None) or str(e)
+    low = msg.lower()
+    if "foreign key" in low:
+        msg = ("Other records still use this, so it cannot be deleted yet (for example orders, quick sales or "
+               "client-owned fabric). Remove those first.")
+    elif "receipt_no" in low and "duplicate" in low:
+        msg = "That receipt number already exists. Leave it blank to generate a new one."
+    st.error(msg)
 
 
 def done(msg):
@@ -145,9 +153,10 @@ CFG = {
         f=[F("order_id", "Order", "s", "orders:id:order_no"), F("fitting_date", "Fitting date", "d"),
            F("notes", kind="x"), F("adjustments", kind="x")]),
     "payments": dict(title="Payments received", order="paid_at",
-        cols=["order_id", "amount", "method", "paid_at"],
+        cols=["receipt_no", "order_id", "amount", "method", "paid_at"],
         f=[F("order_id", "Order", "s", "orders:id:order_no"), F("amount", kind="n"),
-           F("method", kind="s", extra=["cash", "transfer", "POS", "other"]), F("reference")]),
+           F("method", kind="s", extra=["cash", "transfer", "POS", "other"]),
+           F("receipt_no", "Receipt number (leave blank to generate one)")]),
     "order_balances": dict(title="Balances", ro=True, order=None,
         cols=["order_no", "total_amount", "paid", "outstanding", "payment_status"]),
     "expenses": dict(title="Expenses", order="spent_on", cols=["category", "description", "amount", "spent_on"],
@@ -289,6 +298,9 @@ def add_form(name):
                         after = db().table("orders").select("order_no,stage").eq("id", rec["order_id"]).execute().data
                         if before[0]["stage"] == "order_received" and after and after[0]["stage"] == "payment_confirmed":
                             msg = f"Payment saved. {after[0]['order_no']} moved to Payment Confirmed automatically."
+                    if name == "payments" and res.data:
+                        st.session_state["receipt_sel"] = res.data[0]["id"]
+                        msg += f" Receipt {res.data[0].get('receipt_no') or ''} is ready to download below."
                     if det:  # order details (garment, fabric, style...) go to the design details record
                         db().table("fashion_order_details").upsert({"order_id": res.data[0]["id"], **det}).execute()
                     done(msg)
@@ -336,6 +348,7 @@ def table_view(name):
     if name == "payments":
         st.caption("Recording a payment on an order that is at Order Received moves it to Payment Confirmed "
                    "automatically. Nothing else moves by itself.")
+        receipt_section()
     if name == "stock_levels":
         st.caption("**Low-stock alert at** is the level that warns you: when the yards on hand fall to this "
                    "number or below, the item shows LOW and appears on the dashboard. "
@@ -498,6 +511,98 @@ def stock_out():
     movement_history(["out", "adjust_down"])
 
 
+# ---------------------------------------------------------------- receipts
+def ascii_safe(t):
+    """The PDF's built-in font handles plain Latin letters only, so accents are simplified."""
+    t = unicodedata.normalize("NFKD", str(t or ""))
+    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    return t.encode("latin-1", "replace").decode("latin-1")
+
+
+def receipt_pdf(r):
+    from fpdf import FPDF
+    pdf = FPDF(format="A5")
+    pdf.set_auto_page_break(False)
+    pdf.add_page()
+    w = pdf.w - 2 * pdf.l_margin
+    pdf.set_font("Helvetica", "B", 22)
+    pdf.cell(w, 12, ascii_safe(BIZ), align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(110, 110, 110)
+    pdf.cell(w, 6, "PAYMENT RECEIPT", align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(3)
+    pdf.set_draw_color(180, 180, 180)
+    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + w, pdf.get_y())
+    pdf.ln(5)
+
+    def pair(label, value, bold=False):
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(110, 110, 110)
+        pdf.cell(w * 0.42, 8, ascii_safe(label))
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("Helvetica", "B" if bold else "", 11)
+        pdf.cell(w * 0.58, 8, ascii_safe(value), align="R", new_x="LMARGIN", new_y="NEXT")
+
+    pair("Receipt number", r["receipt_no"], bold=True)
+    pair("Date", r["date"])
+    pair("Order", r["order_no"])
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(110, 110, 110)
+    pdf.cell(w, 6, "Received from", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_font("Helvetica", "B", 15)
+    pdf.cell(w, 9, ascii_safe(r["customer"]), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+    pdf.set_fill_color(240, 240, 240)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(w, 7, "  Amount received", fill=True, new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "B", 20)
+    pdf.cell(w, 14, ascii_safe(f"{r['code']} {r['amount']:,.2f}"), fill=True, align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(5)
+    pair("Payment method", (r["method"] or "-").capitalize())
+    pair("Order total", f"{r['code']} {r['total']:,.2f}")
+    pair("Paid to date", f"{r['code']} {r['paid_to_date']:,.2f}")
+    pair("Balance", f"{r['code']} {r['balance']:,.2f}", bold=True)
+    if r.get("received_by"):
+        pair("Received by", r["received_by"])
+    pdf.set_y(pdf.h - 28)
+    pdf.set_draw_color(180, 180, 180)
+    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + w, pdf.get_y())
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "I", 9)
+    pdf.set_text_color(110, 110, 110)
+    pdf.cell(w, 5, "Thank you for your patronage.", align="C")
+    return bytes(pdf.output())
+
+
+def receipt_section():
+    pays = rows("payments", "id,receipt_no,amount,method,paid_at,order_id,received_by,"
+                            "orders(order_no,total_amount,customers(full_name))", order="paid_at")
+    if not pays:
+        return
+    code, sym = currency_code(), currency()
+    staff = look("profiles", "id", "full_name")
+    ids = [p["id"] for p in pays]
+    if st.session_state.get("receipt_sel") not in ids:
+        st.session_state["receipt_sel"] = ids[0]
+    st.markdown("#### 🧾 Receipt")
+    pick = st.selectbox("Choose a payment", ids, key="receipt_sel", format_func=lambda i: next(
+        f"{p['receipt_no']} — {p['orders']['customers']['full_name']} — {sym}{float(p['amount']):,.0f} — {p['paid_at'][:10]}"
+        for p in pays if p["id"] == i))
+    p = next(x for x in pays if x["id"] == pick)
+    so_far = sum(float(x["amount"]) for x in pays if x["order_id"] == p["order_id"] and x["paid_at"] <= p["paid_at"])
+    total = float(p["orders"]["total_amount"] or 0)
+    pdf = receipt_pdf({
+        "receipt_no": p["receipt_no"], "date": datetime.fromisoformat(p["paid_at"].replace("Z", "+00:00")).strftime("%d %b %Y"),
+        "order_no": p["orders"]["order_no"], "customer": p["orders"]["customers"]["full_name"],
+        "amount": float(p["amount"]), "method": p.get("method"), "code": code, "total": total,
+        "paid_to_date": so_far, "balance": max(total - so_far, 0), "received_by": staff.get(p.get("received_by"))})
+    st.download_button("⬇ Download receipt (PDF)", data=pdf, file_name=f"{p['receipt_no']}.pdf",
+                       mime="application/pdf", type="primary")
+
+
 # ---------------------------------------------------------------- new order (new or existing customer)
 def order_form():
     customers = look("customers", "id", "full_name")
@@ -544,7 +649,9 @@ def order_form():
                             rec["whatsapp"] = phone.strip()
                         cid = db().table("customers").insert(rec).execute().data[0]["id"]
                         added = True
-                    order = {"customer_id": cid, "stage": stage}
+                    order_no = db().rpc("make_order_no", {"p_customer": cid, "p_garment": garment.strip(),
+                                                          "p_date": date.today().isoformat()}).execute().data
+                    order = {"customer_id": cid, "stage": stage, "order_no": order_no}
                     if offering:
                         order["offering_id"] = offering
                     if due:
@@ -654,6 +761,33 @@ def customer_details():
                      width="stretch", hide_index=True)
     else:
         st.caption("No orders yet for this customer.")
+
+    with st.expander("🗑 Delete this customer"):
+        n = len(orders)
+        st.warning(f"Deleting {pick['full_name']} removes the customer, their contact details and all their measurements. "
+                   + ("They have no orders. " if not n else
+                      f"They have {n} order(s), which must be deleted first. ") + "This cannot be undone.")
+        with_orders = False
+        if n:
+            with_orders = st.checkbox(f"Also delete their {n} order(s), including each order's payments and records",
+                                      key=f"delcust_orders_{pick['id']}")
+        typed = st.text_input("Type the customer's full name to confirm", key=f"delcust_{pick['id']}")
+        if st.button("Delete customer", type="primary", key=f"delcustbtn_{pick['id']}"):
+            if typed.strip().lower() != pick["full_name"].strip().lower():
+                st.error("The name you typed doesn't match.")
+            elif n and not with_orders:
+                st.error("Tick the box to delete their orders too, or delete those orders first under Orders.")
+            else:
+                try:
+                    if n:
+                        db().table("orders").delete().eq("customer_id", pick["id"]).execute()
+                    gone = db().table("customers").delete().eq("id", pick["id"]).execute().data
+                    if gone:
+                        done(f"{pick['full_name']} deleted.")
+                    else:
+                        st.error("Only an owner or manager can delete customers.")
+                except Exception as e:
+                    err(e)
 
 
 # ---------------------------------------------------------------- edit or delete an order
@@ -850,6 +984,25 @@ def staff_page():
                 st.error("You do not have permission to change this person.")
         except Exception as e:
             err(e)
+    with st.expander("🗑 Delete this person"):
+        if not owner:
+            st.info("Only an owner can delete staff. To stop someone using the app, untick Account is active above.")
+        elif pick["id"] == me.get("id"):
+            st.info("You cannot delete your own account.")
+        else:
+            st.warning(f"Deleting {pick['full_name']} removes their login, their profile, their task assignments and "
+                       "their attendance records. Orders and everything they recorded stay. This cannot be undone. "
+                       "If they have simply left the business, untick Account is active above instead.")
+            typed = st.text_input("Type their full name to confirm", key=f"delstaff_{pick['id']}")
+            if st.button("Delete this person", type="primary", key=f"delstaffbtn_{pick['id']}"):
+                if typed.strip().lower() != pick["full_name"].strip().lower():
+                    st.error("The name you typed doesn't match.")
+                else:
+                    try:
+                        db().rpc("delete_staff", {"p_id": pick["id"]}).execute()
+                        done(f"{pick['full_name']} deleted.")
+                    except Exception as e:
+                        err(e)
     password_box("staffpage")
 
 
@@ -973,8 +1126,12 @@ COLORS = ["#3b82f6", "#06b6d4", "#f59e0b", "#fb923c", "#a855f7", "#ec4899", "#22
 BADGE = {"unpaid": ("Unpaid", "b-unpaid"), "partially_paid": ("Part paid", "b-part"), "fully_paid": ("Paid", "b-paid")}
 
 
+def currency_code():
+    return next((r["value"] for r in rows("settings") if r["key"] == "currency"), "NGN")
+
+
 def currency():
-    cur = next((r["value"] for r in rows("settings") if r["key"] == "currency"), "NGN")
+    cur = currency_code()
     return SYM.get(cur, f"{cur} ")
 
 
@@ -1141,7 +1298,7 @@ ICON = {"My tasks": "✅", "My account": "👤", "Dashboard": "▦", "Orders": "
 def main():
     st.markdown(STYLE, unsafe_allow_html=True)
     uid = db().auth.get_user().user.id
-    me = db().table("profiles").select("full_name,role,responsibility").eq("id", uid).execute().data
+    me = db().table("profiles").select("id,full_name,role,responsibility").eq("id", uid).execute().data
     if me:
         st.session_state["me"] = me[0]
     nav = NAV_STAFF if (me and me[0]["role"] == "staff") else NAV
