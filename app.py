@@ -170,6 +170,7 @@ CFG = {
         f=[F("customer_id", "Client", "s", "customers:id:full_name")]),
     "stock_in": dict(title="Stock in"),
     "stock_out": dict(title="Stock out"),
+    "stock_sales": dict(title="Sales history"),
     "rtw_stock": dict(title="Stock levels"),
     "rtw_catalog_page": dict(title="Products & SKUs"),
     "rtw_stock_in": dict(title="Stock in"),
@@ -195,7 +196,7 @@ NAV = {
     "Orders": ["orders", "offerings"],
     "Customers": ["customer_details"],
     "Fashion": ["fashion_order_details", "fashion_design_changes", "fashion_qc", "fashion_fittings"],
-    "Stock": ["stock_levels", "stock_in", "stock_out"],
+    "Material/fabric": ["stock_levels", "stock_in", "stock_out", "stock_sales"],
     "Ready-to-wear": ["rtw_stock", "rtw_catalog_page", "rtw_stock_in", "new_sale", "sales_history"],
     "Money": ["payments", "order_balances", "expenses"],
     "Team": ["staff_page", "work_updates", "attendance", "communications", "message_templates"],
@@ -203,7 +204,7 @@ NAV = {
 
 NAV_STAFF = {
     "My tasks": None,
-    "Stock": ["stock_levels", "stock_out"],
+    "Material/fabric": ["stock_levels", "stock_out"],
     "My account": ["my_account"],
 }
 
@@ -413,10 +414,11 @@ def stock_in():
             client = b.selectbox("Client (only if client-owned)", [None] + list(clients),
                                  format_func=lambda k: "—" if k is None else clients[k])
             colour = a.text_input("Colour")
-            unit = b.text_input("Unit (materials only; fabric is always yards)", value="yards")
+            unit_f = b.selectbox("Fabric measured in", ["yards", "trousers"])
             alert = a.number_input("Low-stock alert at (warn me when on hand is this or less)", value=None, min_value=0.0)
+            unit_m = b.text_input("Unit for materials (e.g. pieces; fabric uses the choice above)", value="pieces")
             st.divider()
-            qty = a.number_input("Quantity (yards for fabric)", value=None, min_value=0.0)
+            qty = a.number_input("Quantity (in the unit chosen)", value=None, min_value=0.0)
             mtype = b.selectbox("Type", ["Opening stock", "Received / purchased", "Adjustment (add)"])
             order = a.selectbox("For order (optional)", [None] + list(orders),
                                 format_func=lambda k: "—" if k is None else orders[k])
@@ -438,7 +440,7 @@ def stock_in():
                         iid = item["item_id"]
                     else:
                         rec = {"name": name.strip(), "kind": kind, "ownership": owner,
-                               "unit": "yards" if kind == "fabric" else (unit.strip() or "pcs")}
+                               "unit": unit_f if kind == "fabric" else (unit_m.strip() or "pcs")}
                         if owner == "client":
                             rec["customer_id"] = client
                         if colour.strip():
@@ -462,39 +464,76 @@ def stock_in():
 
 
 def stock_out():
+    sym = currency()
+    manager = not is_staff_role()
+    ver = st.session_state.get("so_ver", 0)
     items = [i for i in rows("stock_levels") if float(i["on_hand"]) > 0]
     orders = order_names()
     with st.expander("➖ Record stock out", expanded=True):
         if not items:
             st.info("Nothing in stock yet. Record stock in first.")
-        with st.form("stock_out", clear_on_submit=True):
-            item = st.selectbox("Item", [None] + items, format_func=lambda i: "—" if i is None else
-                                f"{i['name']} ({i['ownership']}) · {i['on_hand']} {i['unit']} available")
-            a, b = st.columns(2)
-            qty = a.number_input("Quantity taken out (yards for fabric)", value=None, min_value=0.0)
-            reason = b.selectbox("Reason", ["Pulled for use"] if is_staff_role()
-                                 else ["Pulled for use", "Adjustment (damaged / lost)"])
-            order = a.selectbox("For order (optional)", [None] + list(orders),
+        item = st.selectbox("Item", [None] + items, key=f"so_item_{ver}", format_func=lambda i: "—" if i is None else
+                            f"{i['name']} ({i['ownership']}) · {i['on_hand']} {i['unit']} available")
+        a, b = st.columns(2)
+        qty = a.number_input(f"Quantity taken out ({item['unit'] if item else 'yards or trousers'})", value=None,
+                             min_value=0.0, key=f"so_qty_{ver}")
+        reason = b.selectbox("Reason", ["Pulled for use"] + (["Sold", "Adjustment (damaged / lost)"] if manager else []),
+                             key=f"so_reason_{ver}")
+        price, buyer, order = None, "", None
+        if reason == "Sold":
+            c, d = st.columns(2)
+            price = c.number_input(f"Sold for ({sym}, total amount for this quantity)", value=None, min_value=0.0,
+                                   key=f"so_price_{ver}")
+            buyer = d.text_input("Buyer's name (optional)", key=f"so_buyer_{ver}")
+        else:
+            order = a.selectbox("For order (optional)", [None] + list(orders), key=f"so_order_{ver}",
                                 format_func=lambda k: "—" if k is None else orders[k])
-            note = b.text_input("Note")
-            go = st.form_submit_button("Save stock out", type="primary")
-        if go:
+        note = st.text_input("Note", key=f"so_note_{ver}")
+        if st.button("Save stock out", type="primary", key=f"so_save_{ver}"):
             if not item or not qty or qty <= 0:
                 st.error("Choose the item and enter a quantity above zero.")
+            elif reason == "Sold" and price is None:
+                st.error("Enter the price it was sold for.")
             else:
-                mv = {"item_id": item["item_id"], "qty": qty,
-                      "movement_type": "out" if reason == "Pulled for use" else "adjust_down"}
-                if order:
-                    mv["order_id"] = order
-                if note.strip():
-                    mv["note"] = note.strip()
                 try:
-                    db().table("stock_movements").insert(mv).execute()
-                    done("Stock out saved. Stock levels are updated.")
+                    if reason == "Sold":
+                        db().rpc("record_fabric_sale", {"p_item": item["item_id"], "p_qty": qty, "p_price": price,
+                                                        "p_buyer": buyer.strip(), "p_note": note.strip()}).execute()
+                        msg = f"Sale saved: {sym}{price:,.0f}. Stock levels are updated."
+                    else:
+                        mv = {"item_id": item["item_id"], "qty": qty,
+                              "movement_type": "out" if reason == "Pulled for use" else "adjust_down"}
+                        if order:
+                            mv["order_id"] = order
+                        if note.strip():
+                            mv["note"] = note.strip()
+                        db().table("stock_movements").insert(mv).execute()
+                        msg = "Stock out saved. Stock levels are updated."
+                    st.session_state["so_ver"] = ver + 1
+                    done(msg)
                 except Exception as e:
                     err(e)
     st.markdown("**Stock out history**")
     movement_history(["out", "adjust_down"])
+
+
+def stock_sales_history():
+    sym = currency()
+    data = (db().table("stock_sales").select("*, stock_items(name,unit,colour)")
+            .order("sold_at", desc=True).limit(500).execute().data)
+    if not data:
+        st.info("No fabric or material has been sold yet. Choose Sold under Stock out to record a sale.")
+        return
+    staff = look("profiles", "id", "full_name")
+    df = pd.DataFrame(data)
+    df["item"] = df["stock_items"].map(lambda x: (x or {}).get("name"))
+    df["quantity"] = df.apply(lambda r: f"{float(r['qty']):g} {(r['stock_items'] or {}).get('unit', '')}", axis=1)
+    df["per unit"] = (df["sale_price"].astype(float) / df["qty"].astype(float)).round(0)
+    df["sold by"] = df["sold_by"].map(staff)
+    df["date"] = pd.to_datetime(df["sold_at"]).dt.strftime("%d %b %Y")
+    st.caption(f"{len(df)} sale(s) · total {sym}{df['sale_price'].astype(float).sum():,.0f}")
+    st.dataframe(df[["date", "item", "quantity", "sale_price", "per unit", "buyer_name", "sold by", "note"]]
+                 .rename(columns=lab), width="stretch", hide_index=True)
 
 
 # ---------------------------------------------------------------- receipts
@@ -505,62 +544,156 @@ def ascii_safe(t):
     return t.encode("latin-1", "replace").decode("latin-1")
 
 
-def receipt_pdf(r):
+LAGOS = timezone(timedelta(hours=1))
+
+
+def lagos_dt(v):
+    """An ISO timestamp as '13 Nov 2026 10:42', in Lagos time."""
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).astimezone(LAGOS).strftime("%d %b %Y  %H:%M")
+    except Exception:
+        return "-"
+
+
+def biz_lines():
+    """Optional business address and phone for the receipt header (set in Streamlit Secrets)."""
+    out = []
+    for key in ("BUSINESS_ADDRESS", "BUSINESS_PHONE"):
+        out += [x.strip() for x in str(st.secrets.get(key, "") or "").splitlines() if x.strip()]
+    return out
+
+
+def thermal_pdf(spec, barcode_data=None):
+    """A narrow, payment-terminal style receipt (80 mm wide). `spec` is a list of simple row descriptions."""
     from fpdf import FPDF
-    pdf = FPDF(format="A5")
-    pdf.set_auto_page_break(False)
-    pdf.add_page()
-    w = pdf.w - 2 * pdf.l_margin
-    pdf.set_font("Helvetica", "B", 22)
-    pdf.cell(w, 12, ascii_safe(BIZ), align="C", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_text_color(110, 110, 110)
-    pdf.cell(w, 6, "PAYMENT RECEIPT", align="C", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_text_color(0, 0, 0)
-    pdf.ln(3)
-    pdf.set_draw_color(180, 180, 180)
-    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + w, pdf.get_y())
-    pdf.ln(5)
+    M = 4  # side margin in mm
 
-    def pair(label, value, bold=False):
-        pdf.set_font("Helvetica", "", 10)
-        pdf.set_text_color(110, 110, 110)
-        pdf.cell(w * 0.42, 8, ascii_safe(label))
+    def render(pdf):
+        w = pdf.w - 2 * M
         pdf.set_text_color(0, 0, 0)
-        pdf.set_font("Helvetica", "B" if bold else "", 11)
-        pdf.cell(w * 0.58, 8, ascii_safe(value), align="R", new_x="LMARGIN", new_y="NEXT")
+        for it in spec:
+            kind = it[0]
+            if kind in ("stars", "dash"):
+                pdf.set_font("Courier", "", 9)
+                ch = "*" if kind == "stars" else "-"
+                pdf.cell(w, 4, ch * int(w / pdf.get_string_width(ch)), align="C", new_x="LMARGIN", new_y="NEXT")
+            elif kind == "gap":
+                pdf.ln(it[1])
+            elif kind == "center":           # ("center", text, size, bold)
+                pdf.set_font("Courier", "B" if it[3] else "", it[2])
+                pdf.multi_cell(w, it[2] * 0.46, ascii_safe(it[1]), align="C", new_x="LMARGIN", new_y="NEXT")
+            elif kind == "text":             # ("text", text, size, bold) left aligned, wraps
+                pdf.set_font("Courier", "B" if it[3] else "", it[2])
+                pdf.multi_cell(w, it[2] * 0.46, ascii_safe(it[1]), align="L", new_x="LMARGIN", new_y="NEXT")
+            elif kind == "item":             # ("item", description, amount, indent)
+                size, indent = 9, it[3]
+                pdf.set_font("Courier", "", size)
+                left, right = ascii_safe(it[1]), ascii_safe(it[2])
+                rw = pdf.get_string_width(right) + 1
+                lh = size * 0.46
+                pdf.set_x(M + indent)
+                if pdf.get_string_width(left) <= w - indent - rw - 2:
+                    pdf.cell(w - indent - rw, lh, left)
+                    pdf.cell(rw, lh, right, align="R", new_x="LMARGIN", new_y="NEXT")
+                else:
+                    pdf.multi_cell(w - indent, lh, left, align="L", new_x="LMARGIN", new_y="NEXT")
+                    pdf.cell(w, lh, right, align="R", new_x="LMARGIN", new_y="NEXT")
+            elif kind in ("kv", "total"):    # ("kv", left, right, bold, indent) / ("total", left, right)
+                size, bold, indent = (11.5, True, 0) if kind == "total" else (9, it[3], it[4])
+                pdf.set_font("Courier", "B" if bold else "", size)
+                left, right = ascii_safe(it[1]), ascii_safe(it[2])
+                rw = pdf.get_string_width(right) + 1
+                lw = w - indent - rw
+                cut = left
+                if pdf.get_string_width(cut) > lw - 2:
+                    while len(cut) > 3 and pdf.get_string_width(cut + "..") > lw - 2:
+                        cut = cut[:-1]
+                    cut = cut.rstrip() + ".."
+                pdf.set_x(M + indent)
+                pdf.cell(lw, size * 0.46, cut)
+                pdf.cell(rw, size * 0.46, right, align="R", new_x="LMARGIN", new_y="NEXT")
+        if barcode_data:
+            try:
+                from barcode import Code128
+                bits = Code128(ascii_safe(barcode_data)).build()[0]
+                mod = min(0.45, w / len(bits))
+                x0, y0, hb = M + (w - mod * len(bits)) / 2, pdf.get_y() + 2, 11
+                pdf.set_fill_color(0, 0, 0)
+                i = 0
+                while i < len(bits):
+                    if bits[i] == "1":
+                        j = i
+                        while j < len(bits) and bits[j] == "1":
+                            j += 1
+                        pdf.rect(x0 + i * mod, y0, (j - i) * mod, hb, style="F")
+                        i = j
+                    else:
+                        i += 1
+                pdf.set_y(y0 + hb + 1)
+                pdf.set_font("Courier", "", 8)
+                pdf.cell(w, 4, ascii_safe(barcode_data), align="C", new_x="LMARGIN", new_y="NEXT")
+            except Exception:
+                pass  # the receipt is still fine without a barcode
 
-    pair("Receipt number", r["receipt_no"], bold=True)
-    pair("Date", r["date"])
-    pair("Order", r["order_no"])
-    pdf.ln(2)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_text_color(110, 110, 110)
-    pdf.cell(w, 6, "Received from", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_text_color(0, 0, 0)
-    pdf.set_font("Helvetica", "B", 15)
-    pdf.cell(w, 9, ascii_safe(r["customer"]), new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(3)
-    pdf.set_fill_color(240, 240, 240)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(w, 7, "  Amount received", fill=True, new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Helvetica", "B", 20)
-    pdf.cell(w, 14, ascii_safe(f"{r['code']} {r['amount']:,.2f}"), fill=True, align="C", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(5)
-    pair("Payment method", (r["method"] or "-").capitalize())
-    pair("Order total", f"{r['code']} {r['total']:,.2f}")
-    pair("Paid to date", f"{r['code']} {r['paid_to_date']:,.2f}")
-    pair("Balance", f"{r['code']} {r['balance']:,.2f}", bold=True)
-    if r.get("received_by"):
-        pair("Received by", r["received_by"])
-    pdf.set_y(pdf.h - 28)
-    pdf.set_draw_color(180, 180, 180)
-    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + w, pdf.get_y())
-    pdf.ln(4)
-    pdf.set_font("Helvetica", "I", 9)
-    pdf.set_text_color(110, 110, 110)
-    pdf.cell(w, 5, "Thank you for your patronage.", align="C")
+    def new_page(h):
+        pdf = FPDF(unit="mm", format=(80, h))
+        pdf.set_auto_page_break(False)
+        pdf.set_margins(M, M, M)
+        pdf.add_page()
+        return pdf
+
+    probe = new_page(900)          # first pass: measure how tall the receipt needs to be
+    render(probe)
+    pdf = new_page(probe.get_y() + 6)
+    render(pdf)
     return bytes(pdf.output())
+
+
+def receipt_header(title):
+    head = [("stars",), ("center", title, 11, False), ("stars",), ("gap", 2),
+            ("center", BIZ.upper(), 14, True)]
+    head += [("center", line, 8, False) for line in biz_lines()]
+    return head + [("gap", 1), ("dash",)]
+
+
+def receipt_pdf(r):
+    """Receipt for ONE payment on a bespoke order."""
+    code, amt = r["code"], f"{r['code']} {r['amount']:,.2f}"
+    spec = receipt_header("RECEIPT") + [
+        ("kv", "Receipt no", r["receipt_no"], False, 0),
+        ("kv", "Date", r["date"], False, 0),
+        ("kv", "Order", r["order_no"], False, 0),
+        ("gap", 1), ("text", "Received from", 8, False), ("text", r["customer"], 11, True),
+        ("dash",),
+        ("kv", f"1x Payment ({(r['method'] or '-').capitalize()})", f"{r['amount']:,.2f}", False, 3),
+        ("dash",),
+        ("total", "TOTAL PAID", amt),
+        ("kv", "Order total", f"{code} {r['total']:,.2f}", False, 6),
+        ("kv", "Paid to date", f"{code} {r['paid_to_date']:,.2f}", False, 6),
+        ("kv", "Balance", f"{code} {r['balance']:,.2f}", True, 6),
+    ]
+    if r.get("received_by"):
+        spec.append(("kv", "Received by", r["received_by"], False, 6))
+    spec += [("dash",), ("gap", 1), ("center", "THANK YOU", 12, True), ("gap", 1), ("stars",)]
+    return thermal_pdf(spec, r["receipt_no"])
+
+
+def sale_receipt_pdf(r):
+    """Receipt for a ready-to-wear sale (several items)."""
+    code = currency_code()
+    spec = receipt_header("RECEIPT") + [
+        ("kv", "Receipt no", r["sale_no"], False, 0),
+        ("kv", "Date", lagos_dt(r["sold_at"]), False, 0),
+        ("gap", 1), ("text", "Sold to", 8, False), ("text", r.get("buyer") or "Walk-in customer", 11, True),
+        ("dash",),
+    ]
+    for it in r["items"]:
+        desc = f"{it['qty']}x {it['name']} {it.get('colour') or ''} {it.get('size') or ''}".replace("  ", " ").strip()
+        spec.append(("item", desc, f"{float(it['unit_price'] or 0) * int(it['qty']):,.2f}", 3))
+    spec += [("dash",), ("total", "TOTAL", f"{code} {float(r['total'] or 0):,.2f}"),
+             ("kv", "Paid by", (r.get("method") or "-").capitalize(), False, 6),
+             ("dash",), ("gap", 1), ("center", "THANK YOU", 12, True), ("gap", 1), ("stars",)]
+    return thermal_pdf(spec, r["sale_no"])
 
 
 def receipt_section():
@@ -581,7 +714,7 @@ def receipt_section():
     so_far = sum(float(x["amount"]) for x in pays if x["order_id"] == p["order_id"] and x["paid_at"] <= p["paid_at"])
     total = float(p["orders"]["total_amount"] or 0)
     pdf = receipt_pdf({
-        "receipt_no": p["receipt_no"], "date": datetime.fromisoformat(p["paid_at"].replace("Z", "+00:00")).strftime("%d %b %Y"),
+        "receipt_no": p["receipt_no"], "date": lagos_dt(p["paid_at"]),
         "order_no": p["orders"]["order_no"], "customer": p["orders"]["customers"]["full_name"],
         "amount": float(p["amount"]), "method": p.get("method"), "code": code, "total": total,
         "paid_to_date": so_far, "balance": max(total - so_far, 0), "received_by": staff.get(p.get("received_by"))})
@@ -1248,68 +1381,6 @@ def rtw_stock_in():
         st.dataframe(df[["sku", "movement_type", "qty", "note", "date"]].rename(columns=lab), width="stretch", hide_index=True)
 
 
-def sale_receipt_pdf(r):
-    from fpdf import FPDF
-    pdf = FPDF(format="A5")
-    pdf.set_auto_page_break(False)
-    pdf.add_page()
-    w = pdf.w - 2 * pdf.l_margin
-    code = currency_code()
-    pdf.set_font("Helvetica", "B", 22)
-    pdf.cell(w, 12, ascii_safe(BIZ), align="C", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_text_color(110, 110, 110)
-    pdf.cell(w, 6, "SALES RECEIPT", align="C", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_text_color(0, 0, 0)
-    pdf.ln(3)
-    pdf.set_draw_color(180, 180, 180)
-    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + w, pdf.get_y())
-    pdf.ln(4)
-
-    def pair(label, value, bold=False):
-        pdf.set_font("Helvetica", "", 10)
-        pdf.set_text_color(110, 110, 110)
-        pdf.cell(w * 0.42, 7, ascii_safe(label))
-        pdf.set_text_color(0, 0, 0)
-        pdf.set_font("Helvetica", "B" if bold else "", 11)
-        pdf.cell(w * 0.58, 7, ascii_safe(value), align="R", new_x="LMARGIN", new_y="NEXT")
-
-    when = datetime.fromisoformat(str(r["sold_at"]).replace("Z", "+00:00")).strftime("%d %b %Y")
-    pair("Receipt number", r["sale_no"], bold=True)
-    pair("Date", when)
-    pair("Sold to", r.get("buyer") or "Walk-in customer")
-    pdf.ln(3)
-    widths = [w * 0.46, w * 0.10, w * 0.22, w * 0.22]
-    pdf.set_fill_color(240, 240, 240)
-    pdf.set_font("Helvetica", "B", 9)
-    for head, wd, al in zip(["Item", "Qty", "Price", "Total"], widths, ["L", "C", "R", "R"]):
-        pdf.cell(wd, 7, head, fill=True, align=al)
-    pdf.ln(7)
-    pdf.set_font("Helvetica", "", 9)
-    for it in r["items"]:
-        desc = ascii_safe(f"{it['name']} {it.get('colour') or ''} {it.get('size') or ''}".strip())[:28]
-        unit = float(it["unit_price"] or 0)
-        pdf.cell(widths[0], 7, desc)
-        pdf.cell(widths[1], 7, str(it["qty"]), align="C")
-        pdf.cell(widths[2], 7, f"{unit:,.0f}", align="R")
-        pdf.cell(widths[3], 7, f"{unit * int(it['qty']):,.0f}", align="R")
-        pdf.ln(7)
-    pdf.ln(2)
-    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + w, pdf.get_y())
-    pdf.ln(3)
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(w * 0.5, 10, "Total")
-    pdf.cell(w * 0.5, 10, ascii_safe(f"{code} {float(r['total'] or 0):,.2f}"), align="R", new_x="LMARGIN", new_y="NEXT")
-    pair("Payment method", (r.get("method") or "-").capitalize())
-    pdf.set_y(pdf.h - 28)
-    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + w, pdf.get_y())
-    pdf.ln(4)
-    pdf.set_font("Helvetica", "I", 9)
-    pdf.set_text_color(110, 110, 110)
-    pdf.cell(w, 5, "Thank you for your patronage.", align="C")
-    return bytes(pdf.output())
-
-
 def new_sale():
     sym = currency()
     last = st.session_state.get("last_sale")
@@ -1390,7 +1461,7 @@ def sales_history():
                        mime="application/pdf", type="primary", key=f"dl_{pick['id']}")
 
 
-CUSTOM = {"rtw_stock": rtw_stock, "rtw_catalog_page": rtw_catalog_page, "rtw_stock_in": rtw_stock_in, "new_sale": new_sale, "sales_history": sales_history, "staff_page": staff_page, "my_account": my_account, "customer_details": customer_details, "stock_in": stock_in, "stock_out": stock_out, "fashion_design_changes": design_changes}
+CUSTOM = {"rtw_stock": rtw_stock, "rtw_catalog_page": rtw_catalog_page, "rtw_stock_in": rtw_stock_in, "new_sale": new_sale, "sales_history": sales_history, "staff_page": staff_page, "my_account": my_account, "customer_details": customer_details, "stock_in": stock_in, "stock_out": stock_out, "stock_sales": stock_sales_history, "fashion_design_changes": design_changes}
 
 
 # ---------------------------------------------------------------- dashboard & board
@@ -1511,7 +1582,8 @@ def dashboard():
                     win = "locked" if pos[o["stage"]] >= cut else \
                         ("limited" if det.get("change_window") == "limited" else "open")
                     pct = round(100 * pos[o["stage"]] / len(stages))
-                    with st.container(border=True):
+                    due_txt = date.fromisoformat(o["due_date"]).strftime("%d %b") if o.get("due_date") else "no date"
+                    with st.expander(f"**{o['customers']['full_name']}** · {sym}{float(o['total_amount'] or 0):,.0f} · {due_txt}"):
                         st.markdown(card_html(o, det, bal.get(o["id"], {}), pct, color, sym), unsafe_allow_html=True)
                         i = keys.index(s["key"])
                         if s["key"] == "order_received":
@@ -1560,6 +1632,8 @@ def sidebar_summary():
                    .gte("paid_at", date.today().isoformat()).execute().data)
         paid += sum(float(q["total"]) for q in db().table("quick_sales").select("total")
                     .gte("sold_at", date.today().isoformat()).execute().data)
+        paid += sum(float(q["sale_price"]) for q in db().table("stock_sales").select("sale_price")
+                    .gte("sold_at", date.today().isoformat()).execute().data)
         st.markdown(f'<div class="sum"><b>Today\'s Summary</b><br>📋 {active} active orders<br>'
                     f'⚠ {delayed} delayed<br>💵 {sym}{paid:,.0f} received today</div>', unsafe_allow_html=True)
     except Exception:
@@ -1587,7 +1661,9 @@ LOGIN_CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;0,700;1,500&family=Inter:wght@400;500;600&display=swap');
 [data-testid="stHeader"],[data-testid="stToolbar"],[data-testid="stDecoration"],[data-testid="stStatusWidget"],#MainMenu,footer{display:none !important}
 .stApp{background:#faf7f2}
-html,body,.stApp,.stApp *{font-family:'Inter',system-ui,sans-serif}
+html,body,.stApp{font-family:'Inter',system-ui,sans-serif}
+.stApp p,.stApp label,.stApp input,.stApp button,.stApp textarea,.stApp li,.stApp a{font-family:'Inter',system-ui,sans-serif}
+.material-symbols-rounded,[data-testid="stIconMaterial"],span[class*="material"]{font-family:'Material Symbols Rounded','Material Icons' !important}
 [data-testid="stMainBlockContainer"],.block-container{padding:0 !important;max-width:none !important}
 .th-hero{position:fixed;left:0;top:0;bottom:0;width:56vw;overflow:hidden;background:#14202e;z-index:0}
 .th-hero::before{content:"";position:absolute;inset:0;background:url(__IMG__) center top/cover no-repeat;
@@ -1612,12 +1688,12 @@ html,body,.stApp,.stApp *{font-family:'Inter',system-ui,sans-serif}
 .th-hello{margin-top:1.1rem;font-size:.7rem;letter-spacing:.3em;text-transform:uppercase;color:#a0937f}
 .th-sub{margin-top:.35rem;color:#5d564c;font-size:.95rem}
 [data-testid="stForm"]{border:none !important;padding:0 !important;background:transparent}
-[data-testid="stTextInput"] label p{font-size:.7rem;letter-spacing:.16em;text-transform:uppercase;color:#8a7f70;font-weight:500}
+[data-testid="stTextInput"] label p{font-size:.7rem;letter-spacing:.16em;text-transform:uppercase;color:#8a7f70;font-weight:500;padding-left:14px}
 [data-testid="stTextInput"] div[data-baseweb="input"],[data-testid="stTextInput"] div[data-baseweb="base-input"]{
   background:transparent !important;border:none !important;border-radius:0 !important}
 [data-testid="stTextInput"] div[data-baseweb="input"]{border-bottom:1px solid #cfc6b8 !important}
 [data-testid="stTextInput"] div[data-baseweb="input"]:focus-within{border-bottom:1px solid #14202e !important}
-[data-testid="stTextInput"] input{background:transparent !important;padding-left:0 !important;font-size:1rem;color:#14202e}
+[data-testid="stTextInput"] input{background:transparent !important;padding-left:14px !important;font-size:1rem;color:#14202e}
 [data-testid="stFormSubmitButton"] button{width:100%;height:3.1rem;border-radius:0 !important;border:none !important;
   background:#14202e !important;color:#fff !important;letter-spacing:.18em;text-transform:uppercase;font-size:.78rem;font-weight:600}
 [data-testid="stFormSubmitButton"] button:hover{background:#243a52 !important}
@@ -1682,7 +1758,7 @@ def login():
                 '<span>Powered by Nexxora</span></div>', unsafe_allow_html=True)
 
 
-ICON = {"My tasks": "✅", "My account": "👤", "Dashboard": "▦", "Orders": "🛍", "Customers": "👥", "Fashion": "🧵", "Stock": "📦",
+ICON = {"My tasks": "✅", "My account": "👤", "Dashboard": "▦", "Orders": "🛍", "Customers": "👥", "Fashion": "🧵", "Material/fabric": "📦",
         "Ready-to-wear": "👗", "Money": "💳", "Team": "🧑‍🤝‍🧑"}
 
 
